@@ -1,6 +1,7 @@
 use hayai::prelude::*;
 use hayai::serde::Deserialize;
 use hayai::schemars::JsonSchema;
+use std::collections::HashMap;
 
 /// A user in the system
 #[api_model]
@@ -66,6 +67,8 @@ struct UserProfile {
     address: Address,
     tags: Vec<String>,
     nickname: Option<String>,
+    /// Custom metadata key-value pairs
+    metadata: HashMap<String, String>,
 }
 
 /// Query parameters for listing users
@@ -146,6 +149,9 @@ async fn main() {
     HayaiApp::new()
         .title("My API")
         .version("1.0.0")
+        .description("A sample API demonstrating Hayai features")
+        .contact("Author", "author@example.com", "https://example.com")
+        .license("MIT", "https://opensource.org/licenses/MIT")
         .server("http://localhost:3001")
         .bearer_auth()
         .dep(Database)

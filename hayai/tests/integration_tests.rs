@@ -1,5 +1,6 @@
 use hayai::prelude::*;
 use hayai::openapi;
+use std::collections::HashMap;
 
 #[api_model]
 #[derive(Debug, Clone)]
@@ -589,3 +590,180 @@ fn test_bearer_auth_builder() {
         .bearer_auth();
     let _ = app;
 }
+
+// ---- Issue #1: SwaggerMode Embedded ----
+
+#[test]
+fn test_swagger_mode_embedded_default() {
+    let app = HayaiApp::new().title("Test");
+    let router = app.into_router();
+    // Just verify it builds without panic (embedded mode is default)
+    let _ = router;
+}
+
+#[test]
+fn test_swagger_mode_cdn() {
+    let app = HayaiApp::new()
+        .title("Test")
+        .swagger_cdn("https://custom-cdn.example.com/swagger-ui");
+    let router = app.into_router();
+    let _ = router;
+}
+
+#[test]
+fn test_swagger_mode_builder() {
+    let app = HayaiApp::new()
+        .title("Test")
+        .swagger_mode(hayai::SwaggerMode::Embedded);
+    let _ = app.into_router();
+
+    let app2 = HayaiApp::new()
+        .title("Test")
+        .swagger_mode(hayai::SwaggerMode::Cdn("https://example.com".into()));
+    let _ = app2.into_router();
+}
+
+// ---- Issue #2: Description ----
+
+#[test]
+fn test_info_description() {
+    let app = HayaiApp::new()
+        .title("Test API")
+        .version("1.0.0")
+        .description("A test API description");
+    let router = app.into_router();
+    let _ = router;
+}
+
+#[test]
+fn test_openapi_spec_description_in_json() {
+    let spec = openapi::OpenApiSpec {
+        openapi: "3.1.0".to_string(),
+        info: openapi::Info {
+            title: "Test".to_string(),
+            version: "1.0".to_string(),
+            description: Some("My description".to_string()),
+            contact: None,
+            license: None,
+        },
+        servers: vec![],
+        paths: HashMap::new(),
+        schemas: HashMap::new(),
+        security_schemes: HashMap::new(),
+    };
+    let json = spec.to_json();
+    assert_eq!(json["info"]["description"], "My description");
+}
+
+// ---- Issue #3: Contact and License ----
+
+#[test]
+fn test_info_contact_license() {
+    let app = HayaiApp::new()
+        .title("Test API")
+        .contact("Author", "author@example.com", "https://example.com")
+        .license("MIT", "https://opensource.org/licenses/MIT");
+    let _ = app.into_router();
+}
+
+#[test]
+fn test_openapi_spec_contact_license_in_json() {
+    let spec = openapi::OpenApiSpec {
+        openapi: "3.1.0".to_string(),
+        info: openapi::Info {
+            title: "Test".to_string(),
+            version: "1.0".to_string(),
+            description: None,
+            contact: Some(openapi::Contact {
+                name: Some("Author".to_string()),
+                email: Some("a@b.com".to_string()),
+                url: Some("https://example.com".to_string()),
+            }),
+            license: Some(openapi::License {
+                name: "MIT".to_string(),
+                url: Some("https://opensource.org/licenses/MIT".to_string()),
+            }),
+        },
+        servers: vec![],
+        paths: HashMap::new(),
+        schemas: HashMap::new(),
+        security_schemes: HashMap::new(),
+    };
+    let json = spec.to_json();
+    assert_eq!(json["info"]["contact"]["name"], "Author");
+    assert_eq!(json["info"]["contact"]["email"], "a@b.com");
+    assert_eq!(json["info"]["license"]["name"], "MIT");
+    assert_eq!(json["info"]["license"]["url"], "https://opensource.org/licenses/MIT");
+}
+
+// ---- Issue #4: Query param constraints ----
+
+#[derive(hayai::serde::Deserialize, hayai::schemars::JsonSchema)]
+#[allow(dead_code)]
+struct ConstrainedQuery {
+    /// Page number
+    #[schemars(range(min = 1, max = 100))]
+    page: Option<i64>,
+    /// Search term
+    #[schemars(length(min = 1, max = 255))]
+    search: Option<String>,
+}
+
+#[test]
+fn test_query_param_constraints_propagation() {
+    let root = hayai::schemars::schema_for!(ConstrainedQuery);
+    let params = openapi::query_params_from_schema(&root);
+
+    let page_param = params.iter().find(|p| p.name == "page").unwrap();
+    assert_eq!(page_param.minimum, Some(1.0));
+    assert_eq!(page_param.maximum, Some(100.0));
+
+    let search_param = params.iter().find(|p| p.name == "search").unwrap();
+    assert_eq!(search_param.min_length, Some(1));
+    assert_eq!(search_param.max_length, Some(255));
+}
+
+#[test]
+fn test_query_param_constraints_in_serialized_output() {
+    let root = hayai::schemars::schema_for!(ConstrainedQuery);
+    let params = openapi::query_params_from_schema(&root);
+
+    let page_param = params.iter().find(|p| p.name == "page").unwrap();
+    let json = serde_json::to_value(page_param).unwrap();
+    assert_eq!(json["schema"]["minimum"], 1.0);
+    assert_eq!(json["schema"]["maximum"], 100.0);
+}
+
+// ---- Issue #5: HashMap<String, T> → additionalProperties ----
+
+#[api_model]
+#[derive(Debug, Clone)]
+struct WithHashMap {
+    name: String,
+    metadata: HashMap<String, String>,
+}
+
+#[test]
+fn test_hashmap_additional_properties() {
+    let root = hayai::schemars::schema_for!(WithHashMap);
+    let schema = openapi::schema_from_schemars("WithHashMap", &root);
+
+    let meta_prop = schema.properties.get("metadata").unwrap();
+    assert_eq!(meta_prop.type_name, "object");
+    assert!(meta_prop.additional_properties.is_some());
+    let ap = meta_prop.additional_properties.as_ref().unwrap();
+    assert_eq!(ap.type_name, "string");
+}
+
+#[test]
+fn test_hashmap_json_output() {
+    let root = hayai::schemars::schema_for!(WithHashMap);
+    let schema = openapi::schema_from_schemars("WithHashMap", &root);
+    let json = schema.to_json_value();
+
+    let meta = &json["properties"]["metadata"];
+    assert_eq!(meta["type"], "object");
+    assert_eq!(meta["additionalProperties"]["type"], "string");
+}
+
+use hayai::serde_json;

@@ -35,12 +35,23 @@ pub struct SecurityScheme {
 
 impl OpenApiSpec {
     pub fn to_json(&self) -> serde_json::Value {
+        let mut info = serde_json::json!({
+            "title": self.info.title,
+            "version": self.info.version,
+        });
+        if let Some(desc) = &self.info.description {
+            info["description"] = serde_json::Value::String(desc.clone());
+        }
+        if let Some(contact) = &self.info.contact {
+            info["contact"] = serde_json::to_value(contact).unwrap();
+        }
+        if let Some(license) = &self.info.license {
+            info["license"] = serde_json::to_value(license).unwrap();
+        }
+
         let mut val = serde_json::json!({
             "openapi": self.openapi,
-            "info": {
-                "title": self.info.title,
-                "version": self.info.version,
-            },
+            "info": info,
             "paths": {},
             "components": {
                 "schemas": {}
@@ -85,6 +96,26 @@ impl OpenApiSpec {
 pub struct Info {
     pub title: String,
     pub version: String,
+    pub description: Option<String>,
+    pub contact: Option<Contact>,
+    pub license: Option<License>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Contact {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct License {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +183,11 @@ pub struct DynParameter {
     pub required: bool,
     pub schema_type: String,
     pub description: Option<String>,
+    pub minimum: Option<f64>,
+    pub maximum: Option<f64>,
+    pub min_length: Option<u32>,
+    pub max_length: Option<u32>,
+    pub pattern: Option<String>,
 }
 
 impl Serialize for DynParameter {
@@ -161,7 +197,13 @@ impl Serialize for DynParameter {
         map.serialize_entry("name", &self.name)?;
         map.serialize_entry("in", &self.location)?;
         map.serialize_entry("required", &self.required)?;
-        map.serialize_entry("schema", &serde_json::json!({"type": self.schema_type}))?;
+        let mut schema = serde_json::json!({"type": self.schema_type});
+        if let Some(v) = self.minimum { schema["minimum"] = serde_json::json!(v); }
+        if let Some(v) = self.maximum { schema["maximum"] = serde_json::json!(v); }
+        if let Some(v) = self.min_length { schema["minLength"] = serde_json::json!(v); }
+        if let Some(v) = self.max_length { schema["maxLength"] = serde_json::json!(v); }
+        if let Some(v) = &self.pattern { schema["pattern"] = serde_json::json!(v); }
+        map.serialize_entry("schema", &schema)?;
         if let Some(desc) = &self.description {
             map.serialize_entry("description", desc)?;
         }
@@ -275,6 +317,7 @@ pub struct Property {
     pub items: Option<Box<Property>>,
     pub nullable: bool,
     pub example: Option<String>,
+    pub additional_properties: Option<Box<Property>>,
 }
 
 impl Property {
@@ -347,6 +390,9 @@ impl Property {
         }
         if let Some(items) = &self.items {
             obj.insert("items".into(), items.to_json_value());
+        }
+        if let Some(ap) = &self.additional_properties {
+            obj.insert("additionalProperties".into(), ap.to_json_value());
         }
     }
 }
@@ -438,16 +484,51 @@ pub fn query_params_from_schema(root: &schemars::schema::RootSchema) -> Vec<DynP
         for (name, prop_schema) in &obj.properties {
             let type_name = schema_type_string(prop_schema);
             let description = schema_description(prop_schema);
+            let constraints = extract_schema_constraints(prop_schema);
             params.push(DynParameter {
                 name: name.clone(),
                 location: "query".to_string(),
                 required: required_set.contains(name),
                 schema_type: type_name,
                 description,
+                minimum: constraints.0,
+                maximum: constraints.1,
+                min_length: constraints.2,
+                max_length: constraints.3,
+                pattern: constraints.4,
             });
         }
     }
     params
+}
+
+/// Extract numeric/string constraints from a schemars schema
+fn extract_schema_constraints(schema: &schemars::schema::Schema) -> (Option<f64>, Option<f64>, Option<u32>, Option<u32>, Option<String>) {
+    match schema {
+        schemars::schema::Schema::Object(obj) => {
+            // For Option<T> (anyOf), look inside the non-null variant
+            if let Some(sub) = &obj.subschemas {
+                if let Some(any_of) = &sub.any_of {
+                    for s in any_of {
+                        if let schemars::schema::Schema::Object(o) = s {
+                            if let Some(schemars::schema::SingleOrVec::Single(t)) = &o.instance_type {
+                                if **t != schemars::schema::InstanceType::Null {
+                                    return extract_schema_constraints(s);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let minimum = obj.number.as_ref().and_then(|n| n.minimum);
+            let maximum = obj.number.as_ref().and_then(|n| n.maximum);
+            let min_length = obj.string.as_ref().and_then(|s| s.min_length);
+            let max_length = obj.string.as_ref().and_then(|s| s.max_length);
+            let pattern = obj.string.as_ref().and_then(|s| s.pattern.clone());
+            (minimum, maximum, min_length, max_length, pattern)
+        }
+        _ => (None, None, None, None, None),
+    }
 }
 
 /// Extract description from a schemars schema
@@ -519,7 +600,7 @@ pub fn api_error_schema() -> Schema {
         format: None, min_length: None, max_length: None,
         minimum: None, maximum: None, pattern: None, min_items: None,
         description: Some("Error message".to_string()),
-        ref_path: None, items: None, nullable: false, example: None,
+        ref_path: None, items: None, nullable: false, example: None, additional_properties: None,
     });
     properties.insert("details".to_string(), Property {
         type_name: "array".to_string(),
@@ -531,9 +612,9 @@ pub fn api_error_schema() -> Schema {
             type_name: "string".to_string(),
             format: None, min_length: None, max_length: None,
             minimum: None, maximum: None, pattern: None, min_items: None,
-            description: None, ref_path: None, items: None, nullable: false, example: None,
+            description: None, ref_path: None, items: None, nullable: false, example: None, additional_properties: None,
         })),
-        nullable: false, example: None,
+        nullable: false, example: None, additional_properties: None,
     });
     Schema {
         type_name: "object".to_string(),
@@ -559,7 +640,7 @@ fn property_from_schemars_schema(
                     minimum: None, maximum: None, pattern: None, min_items: None,
                     description: None,
                     ref_path: Some(format!("#/components/schemas/{}", ref_name)),
-                    items: None, nullable: false, example: None,
+                    items: None, nullable: false, example: None, additional_properties: None,
                 };
             }
 
@@ -601,7 +682,7 @@ fn property_from_schemars_schema(
                                 type_name: tn,
                                 format: None, min_length: None, max_length: None,
                                 minimum: None, maximum: None, pattern: None, min_items: None,
-                                description: None, ref_path: None, items: None, nullable: true, example: None,
+                                description: None, ref_path: None, items: None, nullable: true, example: None, additional_properties: None,
                             };
                         }
                         tn
@@ -628,10 +709,26 @@ fn property_from_schemars_schema(
                                         minimum: None, maximum: None, pattern: None, min_items: None,
                                         description: None,
                                         ref_path: Some(format!("#/components/schemas/{}", info.name)),
-                                        items: None, nullable: false, example: None,
+                                        items: None, nullable: false, example: None, additional_properties: None,
                                     };
                                 }
                             }
+                        }
+                    }
+                }
+
+                // HashMap<String, T> → object with additionalProperties
+                if type_name == "object" {
+                    if let Some(obj_validation) = &obj.object {
+                        if let Some(ap_schema) = &obj_validation.additional_properties {
+                            let ap_prop = property_from_schemars_schema(ap_schema, definitions);
+                            return Property {
+                                type_name: "object".to_string(),
+                                format: None, min_length: None, max_length: None,
+                                minimum: None, maximum: None, pattern: None, min_items: None,
+                                description: None, ref_path: None, items: None, nullable: false, example: None,
+                                additional_properties: Some(Box::new(ap_prop)),
+                            };
                         }
                     }
                 }
@@ -650,14 +747,14 @@ fn property_from_schemars_schema(
                     return Property {
                         type_name, format: None, min_length: None, max_length: None,
                         minimum: None, maximum: None, pattern: None, min_items: None,
-                        description: None, ref_path: None, items: items_prop, nullable: false, example: None,
+                        description: None, ref_path: None, items: items_prop, nullable: false, example: None, additional_properties: None,
                     };
                 }
 
                 return Property {
                     type_name, format: None, min_length: None, max_length: None,
                     minimum: None, maximum: None, pattern: None, min_items: None,
-                    description: None, ref_path: None, items: None, nullable: false, example: None,
+                    description: None, ref_path: None, items: None, nullable: false, example: None, additional_properties: None,
                 };
             }
 
@@ -665,14 +762,14 @@ fn property_from_schemars_schema(
                 type_name: "string".to_string(),
                 format: None, min_length: None, max_length: None,
                 minimum: None, maximum: None, pattern: None, min_items: None,
-                description: None, ref_path: None, items: None, nullable: false, example: None,
+                description: None, ref_path: None, items: None, nullable: false, example: None, additional_properties: None,
             }
         }
         _ => Property {
             type_name: "string".to_string(),
             format: None, min_length: None, max_length: None,
             minimum: None, maximum: None, pattern: None, min_items: None,
-            description: None, ref_path: None, items: None, nullable: false, example: None,
+            description: None, ref_path: None, items: None, nullable: false, example: None, additional_properties: None,
         },
     }
 }

@@ -144,12 +144,24 @@ pub struct SchemaInfo {
 
 inventory::collect!(SchemaInfo);
 
+/// Swagger UI serving mode
+#[derive(Debug, Clone)]
+pub enum SwaggerMode {
+    /// Load Swagger UI assets from a CDN URL
+    Cdn(String),
+    /// Use embedded Scalar API reference (works offline)
+    Embedded,
+}
+
 /// The main application struct
 pub struct HayaiApp {
     deps: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
     title: String,
     version: String,
-    swagger_cdn_url: Option<String>,
+    description: Option<String>,
+    contact: Option<openapi::Contact>,
+    license: Option<openapi::License>,
+    swagger_mode: SwaggerMode,
     servers: Vec<openapi::Server>,
     security_schemes: HashMap<String, openapi::SecurityScheme>,
 }
@@ -160,7 +172,10 @@ impl HayaiApp {
             deps: HashMap::new(),
             title: env!("CARGO_PKG_NAME").to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            swagger_cdn_url: None,
+            description: None,
+            contact: None,
+            license: None,
+            swagger_mode: SwaggerMode::Embedded,
             servers: Vec::new(),
             security_schemes: HashMap::new(),
         }
@@ -176,8 +191,35 @@ impl HayaiApp {
         self
     }
 
+    pub fn description(mut self, desc: &str) -> Self {
+        self.description = Some(desc.to_string());
+        self
+    }
+
+    pub fn contact(mut self, name: &str, email: &str, url: &str) -> Self {
+        self.contact = Some(openapi::Contact {
+            name: Some(name.to_string()),
+            email: Some(email.to_string()),
+            url: Some(url.to_string()),
+        });
+        self
+    }
+
+    pub fn license(mut self, name: &str, url: &str) -> Self {
+        self.license = Some(openapi::License {
+            name: name.to_string(),
+            url: Some(url.to_string()),
+        });
+        self
+    }
+
+    pub fn swagger_mode(mut self, mode: SwaggerMode) -> Self {
+        self.swagger_mode = mode;
+        self
+    }
+
     pub fn swagger_cdn(mut self, url: &str) -> Self {
-        self.swagger_cdn_url = Some(url.to_string());
+        self.swagger_mode = SwaggerMode::Cdn(url.to_string());
         self
     }
 
@@ -252,10 +294,10 @@ impl HayaiApp {
     }
 
     fn generate_swagger_html(&self) -> String {
-        let cdn_base = self.swagger_cdn_url.as_deref()
-            .unwrap_or("https://unpkg.com/swagger-ui-dist@5");
-        format!(
-            r#"<!DOCTYPE html>
+        match &self.swagger_mode {
+            SwaggerMode::Cdn(cdn_base) => {
+                format!(
+                    r#"<!DOCTYPE html>
 <html>
 <head>
     <title>{title} - Swagger UI</title>
@@ -274,9 +316,31 @@ impl HayaiApp {
     </script>
 </body>
 </html>"#,
-            title = self.title,
-            cdn = cdn_base,
-        )
+                    title = self.title,
+                    cdn = cdn_base,
+                )
+            }
+            SwaggerMode::Embedded => {
+                format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>{title} - API Reference</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>{css}</style>
+</head>
+<body>
+    <script id="api-reference" data-url="/openapi.json"></script>
+    <script>{js}</script>
+</body>
+</html>"#,
+                    title = self.title,
+                    css = include_str!("../assets/scalar.min.css"),
+                    js = include_str!("../assets/scalar.min.js"),
+                )
+            }
+        }
     }
 
     fn generate_openapi_spec(&self) -> openapi::OpenApiSpec {
@@ -383,6 +447,9 @@ impl HayaiApp {
             info: openapi::Info {
                 title: self.title.clone(),
                 version: self.version.clone(),
+                description: self.description.clone(),
+                contact: self.contact.clone(),
+                license: self.license.clone(),
             },
             servers: self.servers.clone(),
             paths,
@@ -413,11 +480,17 @@ impl openapi::OpenApiSpec {
                             .unwrap_or_default();
                         let mut all_params = params;
                         for dp in &dyn_params {
+                            let mut schema = serde_json::json!({ "type": dp.schema_type });
+                            if let Some(v) = dp.minimum { schema["minimum"] = serde_json::json!(v); }
+                            if let Some(v) = dp.maximum { schema["maximum"] = serde_json::json!(v); }
+                            if let Some(v) = dp.min_length { schema["minLength"] = serde_json::json!(v); }
+                            if let Some(v) = dp.max_length { schema["maxLength"] = serde_json::json!(v); }
+                            if let Some(v) = &dp.pattern { schema["pattern"] = serde_json::json!(v); }
                             let mut param = serde_json::json!({
                                 "name": dp.name,
                                 "in": dp.location,
                                 "required": dp.required,
-                                "schema": { "type": dp.schema_type }
+                                "schema": schema
                             });
                             if let Some(desc) = &dp.description {
                                 param["description"] = serde_json::Value::String(desc.clone());
