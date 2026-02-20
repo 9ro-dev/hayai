@@ -38,6 +38,20 @@ fn get_type_name(ty: &Type) -> String {
     "Unknown".to_string()
 }
 
+/// Check if the type is Vec<T> and return the inner type name
+fn get_vec_inner_type_name(ty: &Type) -> Option<String> {
+    if let Type::Path(tp) = ty {
+        if let Some(seg) = tp.path.segments.last() {
+            if seg.ident == "Vec" {
+                if let Some(inner) = extract_inner_type(seg) {
+                    return Some(get_type_name(inner));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn is_primitive_type(ty: &Type) -> bool {
     let name = get_type_name(ty);
     matches!(name.as_str(), "i8"|"i16"|"i32"|"i64"|"i128"|"u8"|"u16"|"u32"|"u64"|"u128"|"f32"|"f64"|"String"|"bool")
@@ -66,19 +80,15 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
     let fn_sig = &input_fn.sig;
     let fn_block = &input_fn.block;
 
-    // Parse custom attributes: #[status(N)], #[tag("x")], doc comments
+    // Parse custom attributes: #[status(N)], #[tag("x")], #[security("x")], doc comments
     let mut status_code: Option<u16> = None;
     let mut tags: Vec<String> = Vec::new();
+    let mut security_schemes: Vec<String> = Vec::new();
     let description = extract_doc_comment(&input_fn.attrs);
 
     let mut clean_attrs: Vec<&syn::Attribute> = Vec::new();
     for attr in &input_fn.attrs {
         if attr.path().is_ident("status") {
-            let _ = attr.parse_nested_meta(|meta| {
-                // #[status(201)] - the 201 is the first token
-                Err(meta.error(""))
-            });
-            // Parse as #[status(N)]
             if let syn::Meta::List(list) = &attr.meta {
                 let tokens = list.tokens.clone();
                 if let Ok(lit) = syn::parse2::<LitInt>(tokens) {
@@ -90,6 +100,13 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
                 let tokens = list.tokens.clone();
                 if let Ok(lit) = syn::parse2::<LitStr>(tokens) {
                     tags.push(lit.value());
+                }
+            }
+        } else if attr.path().is_ident("security") {
+            if let syn::Meta::List(list) = &attr.meta {
+                let tokens = list.tokens.clone();
+                if let Ok(lit) = syn::parse2::<LitStr>(tokens) {
+                    security_schemes.push(lit.value());
                 }
             }
         } else if !attr.path().is_ident("doc") {
@@ -174,6 +191,10 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
     };
     let return_type_name = return_type.map(|t| get_type_name(t)).unwrap_or_else(|| "()".to_string());
 
+    // Detect Vec<T> return type for array schema
+    let is_vec_response = return_type.map(|t| get_vec_inner_type_name(t).is_some()).unwrap_or(false);
+    let vec_inner_type_name = return_type.and_then(|t| get_vec_inner_type_name(t)).unwrap_or_default();
+
     let path_extraction = if !path_param_types.is_empty() {
         let names: Vec<_> = path_param_types.iter().map(|(n,_)| *n).collect();
         let types: Vec<_> = path_param_types.iter().map(|(_,t)| *t).collect();
@@ -242,6 +263,7 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
                 location: "path",
                 required: true,
                 schema: hayai::openapi::SchemaObject::new_type("integer"),
+                description: None,
             }
         }
     }).collect();
@@ -288,12 +310,15 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
                 method: #method_upper,
                 handler_name: #fn_name_str,
                 response_type_name: #return_type_name,
+                is_vec_response: #is_vec_response,
+                vec_inner_type_name: #vec_inner_type_name,
                 parameters: &[#(#path_param_schemas),*],
                 has_body: #has_body,
                 body_type_name: #body_type_name,
                 success_status: #status_lit,
                 description: #description,
                 tags: &[#(#tags),*],
+                security: &[#(#security_schemes),*],
                 query_params_fn: #query_params_fn_expr,
                 register_fn: |app: hayai::axum::Router<hayai::AppState>| {
                     app.route(#axum_path, hayai::axum::routing::#method_ident(#wrapper_name))
@@ -379,6 +404,7 @@ fn api_model_enum(input: ItemEnum) -> TokenStream {
                         required: vec![],
                         description: #desc_expr,
                         enum_values: Some(vec![#(#variant_names.to_string()),*]),
+                        example: None,
                     }
                 },
                 nested_fn: || std::collections::HashMap::new(),
@@ -420,129 +446,138 @@ fn api_model_struct(input: ItemStruct) -> TokenStream {
         }
 
         for attr in &field.attrs {
-            if !attr.path().is_ident("validate") { continue; }
-            let _ = attr.parse_nested_meta(|meta| {
-                if meta.path.is_ident("min_length") {
-                    let value = meta.value()?;
-                    let lit: syn::LitInt = value.parse()?;
-                    let min: usize = lit.base10_parse()?;
-                    validation_checks.push(quote! {
-                        if self.#field_name.len() < #min {
-                            errors.push(format!("{}: must be at least {} characters", #field_name_str, #min));
-                        }
-                    });
-                    schema_patches.push(quote! {
-                        if let Some(prop) = props.get_mut(#field_name_str) {
-                            prop.min_length = Some(#min);
-                        }
-                    });
-                } else if meta.path.is_ident("max_length") {
-                    let value = meta.value()?;
-                    let lit: syn::LitInt = value.parse()?;
-                    let max: usize = lit.base10_parse()?;
-                    validation_checks.push(quote! {
-                        if self.#field_name.len() > #max {
-                            errors.push(format!("{}: must be at most {} characters", #field_name_str, #max));
-                        }
-                    });
-                    schema_patches.push(quote! {
-                        if let Some(prop) = props.get_mut(#field_name_str) {
-                            prop.max_length = Some(#max);
-                        }
-                    });
-                } else if meta.path.is_ident("email") {
-                    validation_checks.push(quote! {
-                        {
-                            let email = &self.#field_name;
-                            let at_count = email.chars().filter(|&c| c == '@').count();
-                            let valid = at_count == 1
-                                && !email.starts_with('@')
-                                && !email.ends_with('@')
-                                && {
-                                    if let Some(at_pos) = email.find('@') {
-                                        let domain = &email[at_pos + 1..];
-                                        !domain.is_empty() && domain.contains('.')
-                                            && !domain.starts_with('.') && !domain.ends_with('.')
-                                    } else {
-                                        false
-                                    }
-                                };
-                            if !valid {
-                                errors.push(format!("{}: must be a valid email address", #field_name_str));
+            if attr.path().is_ident("validate") {
+                let _ = attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("min_length") {
+                        let value = meta.value()?;
+                        let lit: syn::LitInt = value.parse()?;
+                        let min: usize = lit.base10_parse()?;
+                        validation_checks.push(quote! {
+                            if self.#field_name.len() < #min {
+                                errors.push(format!("{}: must be at least {} characters", #field_name_str, #min));
                             }
-                        }
-                    });
-                    schema_patches.push(quote! {
-                        if let Some(prop) = props.get_mut(#field_name_str) {
-                            prop.format = Some("email".to_string());
-                        }
-                    });
-                } else if meta.path.is_ident("minimum") {
-                    let value = meta.value()?;
-                    let lit: syn::LitInt = value.parse()?;
-                    let min: i64 = lit.base10_parse()?;
-                    let min_f64 = min as f64;
-                    validation_checks.push(quote! {
-                        if (self.#field_name as f64) < #min_f64 {
-                            errors.push(format!("{}: must be at least {}", #field_name_str, #min));
-                        }
-                    });
-                    schema_patches.push(quote! {
-                        if let Some(prop) = props.get_mut(#field_name_str) {
-                            prop.minimum = Some(#min_f64);
-                        }
-                    });
-                } else if meta.path.is_ident("maximum") {
-                    let value = meta.value()?;
-                    let lit: syn::LitInt = value.parse()?;
-                    let max: i64 = lit.base10_parse()?;
-                    let max_f64 = max as f64;
-                    validation_checks.push(quote! {
-                        if (self.#field_name as f64) > #max_f64 {
-                            errors.push(format!("{}: must be at most {}", #field_name_str, #max));
-                        }
-                    });
-                    schema_patches.push(quote! {
-                        if let Some(prop) = props.get_mut(#field_name_str) {
-                            prop.maximum = Some(#max_f64);
-                        }
-                    });
-                } else if meta.path.is_ident("pattern") {
-                    let value = meta.value()?;
-                    let lit: syn::LitStr = value.parse()?;
-                    let pat = lit.value();
-                    validation_checks.push(quote! {
-                        {
-                            // Simple pattern check - full regex would need regex crate
-                            // For now store in schema, skip runtime validation
-                        }
-                    });
-                    schema_patches.push(quote! {
-                        if let Some(prop) = props.get_mut(#field_name_str) {
-                            prop.pattern = Some(#pat.to_string());
-                        }
-                    });
-                } else if meta.path.is_ident("min_items") {
-                    let value = meta.value()?;
-                    let lit: syn::LitInt = value.parse()?;
-                    let min: usize = lit.base10_parse()?;
-                    validation_checks.push(quote! {
-                        if self.#field_name.len() < #min {
-                            errors.push(format!("{}: must have at least {} items", #field_name_str, #min));
-                        }
-                    });
-                    schema_patches.push(quote! {
-                        if let Some(prop) = props.get_mut(#field_name_str) {
-                            prop.min_items = Some(#min);
-                        }
-                    });
-                }
-                Ok(())
-            });
+                        });
+                        schema_patches.push(quote! {
+                            if let Some(prop) = props.get_mut(#field_name_str) {
+                                prop.min_length = Some(#min);
+                            }
+                        });
+                    } else if meta.path.is_ident("max_length") {
+                        let value = meta.value()?;
+                        let lit: syn::LitInt = value.parse()?;
+                        let max: usize = lit.base10_parse()?;
+                        validation_checks.push(quote! {
+                            if self.#field_name.len() > #max {
+                                errors.push(format!("{}: must be at most {} characters", #field_name_str, #max));
+                            }
+                        });
+                        schema_patches.push(quote! {
+                            if let Some(prop) = props.get_mut(#field_name_str) {
+                                prop.max_length = Some(#max);
+                            }
+                        });
+                    } else if meta.path.is_ident("email") {
+                        validation_checks.push(quote! {
+                            {
+                                let email = &self.#field_name;
+                                let at_count = email.chars().filter(|&c| c == '@').count();
+                                let valid = at_count == 1
+                                    && !email.starts_with('@')
+                                    && !email.ends_with('@')
+                                    && {
+                                        if let Some(at_pos) = email.find('@') {
+                                            let domain = &email[at_pos + 1..];
+                                            !domain.is_empty() && domain.contains('.')
+                                                && !domain.starts_with('.') && !domain.ends_with('.')
+                                        } else {
+                                            false
+                                        }
+                                    };
+                                if !valid {
+                                    errors.push(format!("{}: must be a valid email address", #field_name_str));
+                                }
+                            }
+                        });
+                        schema_patches.push(quote! {
+                            if let Some(prop) = props.get_mut(#field_name_str) {
+                                prop.format = Some("email".to_string());
+                            }
+                        });
+                    } else if meta.path.is_ident("minimum") {
+                        let value = meta.value()?;
+                        let lit: syn::LitInt = value.parse()?;
+                        let min: i64 = lit.base10_parse()?;
+                        let min_f64 = min as f64;
+                        validation_checks.push(quote! {
+                            if (self.#field_name as f64) < #min_f64 {
+                                errors.push(format!("{}: must be at least {}", #field_name_str, #min));
+                            }
+                        });
+                        schema_patches.push(quote! {
+                            if let Some(prop) = props.get_mut(#field_name_str) {
+                                prop.minimum = Some(#min_f64);
+                            }
+                        });
+                    } else if meta.path.is_ident("maximum") {
+                        let value = meta.value()?;
+                        let lit: syn::LitInt = value.parse()?;
+                        let max: i64 = lit.base10_parse()?;
+                        let max_f64 = max as f64;
+                        validation_checks.push(quote! {
+                            if (self.#field_name as f64) > #max_f64 {
+                                errors.push(format!("{}: must be at most {}", #field_name_str, #max));
+                            }
+                        });
+                        schema_patches.push(quote! {
+                            if let Some(prop) = props.get_mut(#field_name_str) {
+                                prop.maximum = Some(#max_f64);
+                            }
+                        });
+                    } else if meta.path.is_ident("pattern") {
+                        let value = meta.value()?;
+                        let lit: syn::LitStr = value.parse()?;
+                        let pat = lit.value();
+                        schema_patches.push(quote! {
+                            if let Some(prop) = props.get_mut(#field_name_str) {
+                                prop.pattern = Some(#pat.to_string());
+                            }
+                        });
+                    } else if meta.path.is_ident("min_items") {
+                        let value = meta.value()?;
+                        let lit: syn::LitInt = value.parse()?;
+                        let min: usize = lit.base10_parse()?;
+                        validation_checks.push(quote! {
+                            if self.#field_name.len() < #min {
+                                errors.push(format!("{}: must have at least {} items", #field_name_str, #min));
+                            }
+                        });
+                        schema_patches.push(quote! {
+                            if let Some(prop) = props.get_mut(#field_name_str) {
+                                prop.min_items = Some(#min);
+                            }
+                        });
+                    }
+                    Ok(())
+                });
+            } else if attr.path().is_ident("schema") {
+                let _ = attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("example") {
+                        let value = meta.value()?;
+                        let lit: syn::LitStr = value.parse()?;
+                        let example_val = lit.value();
+                        schema_patches.push(quote! {
+                            if let Some(prop) = props.get_mut(#field_name_str) {
+                                prop.example = Some(#example_val.to_string());
+                            }
+                        });
+                    }
+                    Ok(())
+                });
+            }
         }
 
         let mut clean_field = field.clone();
-        clean_field.attrs.retain(|a| !a.path().is_ident("validate"));
+        clean_field.attrs.retain(|a| !a.path().is_ident("validate") && !a.path().is_ident("schema"));
         clean_fields.push(clean_field);
     }
 
@@ -590,7 +625,7 @@ fn api_model_struct(input: ItemStruct) -> TokenStream {
                         patches.insert(name.clone(), hayai::openapi::PropertyPatch {
                             min_length: None, max_length: None, format: None,
                             minimum: None, maximum: None, pattern: None, min_items: None,
-                            description: None,
+                            description: None, example: None,
                         });
                     }
                     <#name as hayai::HasSchemaPatches>::patch_schema(&mut patches);
@@ -604,6 +639,7 @@ fn api_model_struct(input: ItemStruct) -> TokenStream {
                             if patch.pattern.is_some() { prop.pattern = patch.pattern.clone(); }
                             if patch.min_items.is_some() { prop.min_items = patch.min_items; }
                             if patch.description.is_some() { prop.description = patch.description.clone(); }
+                            if patch.example.is_some() { prop.example = patch.example.clone(); }
                         }
                     }
                     schema
@@ -619,7 +655,3 @@ fn api_model_struct(input: ItemStruct) -> TokenStream {
 
     output.into()
 }
-
-// TODO: #[produces("text/plain")] / Raw<T> for non-JSON responses.
-// This would require changes to the wrapper return type and OpenAPI content-type.
-// For now, all endpoints return application/json.

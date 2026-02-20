@@ -323,3 +323,39 @@ async fn test_openapi_query_params() {
         assert_eq!(p["required"], false, "Optional query params should not be required");
     }
 }
+
+// ---- Vec<T> Response E2E ----
+
+#[tokio::test]
+async fn test_openapi_vec_response_schema() {
+    let base = spawn_app().await;
+    let resp = reqwest::get(format!("{base}/openapi.json")).await.unwrap();
+    let body: Value = resp.json().await.unwrap();
+
+    // GET /users returns Vec<User>, should have array schema
+    let get_users = &body["paths"]["/users"]["get"];
+    let success_resp = &get_users["responses"]["200"];
+    let schema = &success_resp["content"]["application/json"]["schema"];
+    assert_eq!(schema["type"], "array", "Vec<T> response should be array type");
+    assert_eq!(schema["items"]["$ref"], "#/components/schemas/User", "Array items should $ref User");
+}
+
+// ---- Enum $ref E2E ----
+
+// Note: The example app has User.status field which is Status enum
+// This test would need a model with an enum field registered - covered by unit tests above
+
+// ---- Response Description E2E ----
+
+#[tokio::test]
+async fn test_openapi_response_descriptions() {
+    let base = spawn_app().await;
+    let resp = reqwest::get(format!("{base}/openapi.json")).await.unwrap();
+    let body: Value = resp.json().await.unwrap();
+
+    let get_user = &body["paths"]["/users/{id}"]["get"];
+    assert_eq!(get_user["responses"]["200"]["description"], "OK");
+
+    let post_user = &body["paths"]["/users"]["post"];
+    assert_eq!(post_user["responses"]["201"]["description"], "Created");
+}

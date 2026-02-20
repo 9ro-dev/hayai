@@ -10,6 +10,7 @@ struct User {
     /// Display name
     name: String,
     /// Email address
+    #[schema(example = "alice@example.com")]
     email: String,
     /// Current account status
     status: Status,
@@ -31,6 +32,7 @@ struct CreateUser {
     #[validate(min_length = 1, max_length = 100)]
     name: String,
     #[validate(email)]
+    #[schema(example = "john@example.com")]
     email: String,
 }
 
@@ -69,7 +71,9 @@ struct UserProfile {
 /// Query parameters for listing users
 #[derive(Deserialize, JsonSchema)]
 struct Pagination {
+    /// Page number (1-based)
     page: Option<i64>,
+    /// Number of items per page
     limit: Option<i64>,
 }
 
@@ -108,6 +112,7 @@ impl Database {
 /// Get a user by ID
 #[get("/users/{id}")]
 #[tag("users")]
+#[security("bearer")]
 async fn get_user(id: i64, db: Dep<Database>) -> User {
     db.get_user(id).await.unwrap()
 }
@@ -115,6 +120,7 @@ async fn get_user(id: i64, db: Dep<Database>) -> User {
 /// List all users with pagination
 #[get("/users")]
 #[tag("users")]
+#[security("bearer")]
 async fn list_users(query: Query<Pagination>, db: Dep<Database>) -> Vec<User> {
     db.list_users(query.page, query.limit).await
 }
@@ -122,6 +128,7 @@ async fn list_users(query: Query<Pagination>, db: Dep<Database>) -> Vec<User> {
 /// Create a new user
 #[post("/users")]
 #[tag("users")]
+#[security("bearer")]
 async fn create_user(body: CreateUser, db: Dep<Database>) -> User {
     db.create_user(&body).await
 }
@@ -129,6 +136,7 @@ async fn create_user(body: CreateUser, db: Dep<Database>) -> User {
 /// Delete a user by ID
 #[delete("/users/{id}")]
 #[tag("users")]
+#[security("bearer")]
 async fn delete_user(id: i64, db: Dep<Database>) -> () {
     db.delete_user(id).await
 }
@@ -138,6 +146,8 @@ async fn main() {
     HayaiApp::new()
         .title("My API")
         .version("1.0.0")
+        .server("http://localhost:3001")
+        .bearer_auth()
         .dep(Database)
         .serve("0.0.0.0:3001")
         .await;

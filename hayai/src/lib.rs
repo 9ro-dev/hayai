@@ -120,12 +120,15 @@ pub struct RouteInfo {
     pub method: &'static str,
     pub handler_name: &'static str,
     pub response_type_name: &'static str,
+    pub is_vec_response: bool,
+    pub vec_inner_type_name: &'static str,
     pub parameters: &'static [openapi::Parameter],
     pub has_body: bool,
     pub body_type_name: &'static str,
     pub success_status: u16,
     pub description: &'static str,
     pub tags: &'static [&'static str],
+    pub security: &'static [&'static str],
     pub query_params_fn: Option<fn() -> Vec<openapi::DynParameter>>,
     pub register_fn: fn(Router<AppState>) -> Router<AppState>,
 }
@@ -147,6 +150,8 @@ pub struct HayaiApp {
     title: String,
     version: String,
     swagger_cdn_url: Option<String>,
+    servers: Vec<openapi::Server>,
+    security_schemes: HashMap<String, openapi::SecurityScheme>,
 }
 
 impl HayaiApp {
@@ -156,6 +161,8 @@ impl HayaiApp {
             title: env!("CARGO_PKG_NAME").to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             swagger_cdn_url: None,
+            servers: Vec::new(),
+            security_schemes: HashMap::new(),
         }
     }
 
@@ -177,6 +184,26 @@ impl HayaiApp {
     pub fn dep<T: 'static + Send + Sync>(mut self, dep: T) -> Self {
         self.deps.insert(TypeId::of::<T>(), Arc::new(dep));
         self
+    }
+
+    pub fn server(mut self, url: &str) -> Self {
+        self.servers.push(openapi::Server { url: url.to_string() });
+        self
+    }
+
+    pub fn security_scheme(mut self, name: &str, scheme: openapi::SecurityScheme) -> Self {
+        self.security_schemes.insert(name.to_string(), scheme);
+        self
+    }
+
+    pub fn bearer_auth(self) -> Self {
+        self.security_scheme("bearerAuth", openapi::SecurityScheme {
+            scheme_type: "http".to_string(),
+            scheme: Some("bearer".to_string()),
+            bearer_format: None,
+            name: None,
+            location: None,
+        })
     }
 
     pub fn into_router(self) -> Router {
@@ -267,14 +294,6 @@ impl HayaiApp {
 
         let mut paths = HashMap::new();
         for route in inventory::iter::<RouteInfo> {
-            let mut all_params: Vec<openapi::Parameter> = route.parameters.to_vec();
-
-            // Combine query parameters
-            let mut dyn_params = Vec::new();
-            if let Some(qfn) = route.query_params_fn {
-                dyn_params = qfn();
-            }
-
             let description = if route.description.is_empty() {
                 None
             } else {
@@ -284,6 +303,32 @@ impl HayaiApp {
             let tags: Vec<String> = route.tags.iter().map(|s| s.to_string()).collect();
 
             let status_code = route.success_status.to_string();
+
+            // Build security requirements for this operation
+            let security: Vec<HashMap<String, Vec<String>>> = route.security.iter().map(|s| {
+                let scheme_name = match *s {
+                    "bearer" => "bearerAuth",
+                    other => other,
+                };
+                let mut map = HashMap::new();
+                map.insert(scheme_name.to_string(), vec![]);
+                map
+            }).collect();
+
+            // Build response schema ref
+            let schema_ref_value = if route.success_status == 204 {
+                None
+            } else if route.is_vec_response {
+                // Array response: inline array schema with $ref items
+                Some(serde_json::json!({
+                    "type": "array",
+                    "items": { "$ref": format!("#/components/schemas/{}", route.vec_inner_type_name) }
+                }))
+            } else {
+                Some(serde_json::json!({ "$ref": format!("#/components/schemas/{}", route.response_type_name) }))
+            };
+
+            let success_desc = openapi::status_description(route.success_status).to_string();
 
             let operation = openapi::Operation {
                 summary: Some(route.handler_name.replace('_', " ")),
@@ -303,88 +348,48 @@ impl HayaiApp {
                 responses: {
                     let mut map = HashMap::new();
 
-                    // Success response
-                    let success_desc = match route.success_status {
-                        201 => "Created",
-                        204 => "No Content",
-                        _ => "Successful response",
-                    };
-                    let schema_ref = if route.success_status == 204 {
-                        None
-                    } else {
-                        Some(format!("#/components/schemas/{}", route.response_type_name))
-                    };
                     map.insert(status_code, openapi::ResponseDef {
-                        description: success_desc.to_string(),
-                        schema_ref,
+                        description: success_desc,
+                        schema_ref: schema_ref_value,
                     });
 
                     // Error responses
                     map.insert("400".to_string(), openapi::ResponseDef {
                         description: "Bad Request".to_string(),
-                        schema_ref: Some("#/components/schemas/ApiError".to_string()),
+                        schema_ref: Some(serde_json::json!({ "$ref": "#/components/schemas/ApiError" })),
                     });
                     if route.has_body {
                         map.insert("422".to_string(), openapi::ResponseDef {
                             description: "Validation Failed".to_string(),
-                            schema_ref: Some("#/components/schemas/ApiError".to_string()),
+                            schema_ref: Some(serde_json::json!({ "$ref": "#/components/schemas/ApiError" })),
                         });
                     }
                     map.insert("500".to_string(), openapi::ResponseDef {
                         description: "Internal Server Error".to_string(),
-                        schema_ref: Some("#/components/schemas/ApiError".to_string()),
+                        schema_ref: Some(serde_json::json!({ "$ref": "#/components/schemas/ApiError" })),
                     });
 
                     map
                 },
+                security,
             };
 
-            // Merge dynamic query params into the operation
-            // We need to serialize them alongside static params
             let path_item = paths.entry(route.path.to_string()).or_insert_with(HashMap::new);
-
-            // If there are dynamic query params, we need to handle them
-            if !dyn_params.is_empty() {
-                let mut op = operation;
-                // We'll add query params as a custom serialization step
-                // For now, convert DynParameter to Parameter won't work due to &'static str
-                // Instead, we'll handle this in the spec serialization
-                // Actually, let's store them differently - use a wrapper
-                path_item.insert(route.method.to_lowercase(), op);
-                // We'll fix serialization to include dyn params
-                // For now, let's use a different approach: store in a side map
-            } else {
-                path_item.insert(route.method.to_lowercase(), operation);
-            }
+            path_item.insert(route.method.to_lowercase(), operation);
         }
 
-        // Second pass: inject dynamic query params into the JSON
-        // Actually, let's build the spec properly by customizing to_json
-        let mut spec = openapi::OpenApiSpec {
+        openapi::OpenApiSpec {
             openapi: "3.1.0".to_string(),
             info: openapi::Info {
                 title: self.title.clone(),
                 version: self.version.clone(),
             },
+            servers: self.servers.clone(),
             paths,
             schemas,
-        };
-
-        // We need to patch query params into the spec JSON.
-        // Let's store a side-channel for query params
-        // Actually, the cleanest approach: store dyn params in Operation itself.
-        // But Operation uses Vec<Parameter> with &'static str.
-        // Let me just override to_json to handle this.
-
-        spec
+            security_schemes: self.security_schemes.clone(),
+        }
     }
-}
-
-// Store query param functions keyed by (path, method) for the JSON serialization
-// This is a workaround for the static lifetime issue
-thread_local! {
-    static QUERY_PARAMS: std::cell::RefCell<HashMap<(String, String), Vec<openapi::DynParameter>>> =
-        std::cell::RefCell::new(HashMap::new());
 }
 
 impl openapi::OpenApiSpec {
@@ -408,12 +413,16 @@ impl openapi::OpenApiSpec {
                             .unwrap_or_default();
                         let mut all_params = params;
                         for dp in &dyn_params {
-                            all_params.push(serde_json::json!({
+                            let mut param = serde_json::json!({
                                 "name": dp.name,
                                 "in": dp.location,
                                 "required": dp.required,
                                 "schema": { "type": dp.schema_type }
-                            }));
+                            });
+                            if let Some(desc) = &dp.description {
+                                param["description"] = serde_json::Value::String(desc.clone());
+                            }
+                            all_params.push(param);
                         }
                         op["parameters"] = serde_json::Value::Array(all_params);
                     }

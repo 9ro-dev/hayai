@@ -1,6 +1,5 @@
 use hayai::prelude::*;
 use hayai::openapi;
-use std::collections::HashMap;
 
 #[api_model]
 #[derive(Debug, Clone)]
@@ -187,7 +186,7 @@ fn test_nested_json_serialization() {
 struct MockDb;
 
 #[get("/test/{id}")]
-async fn test_get_route(id: i64, db: Dep<MockDb>) -> TestUser {
+async fn test_get_route(id: i64, _db: Dep<MockDb>) -> TestUser {
     TestUser { id, name: "test".into() }
 }
 
@@ -384,7 +383,7 @@ fn test_numeric_schema_json() {
 #[post("/items")]
 #[status(201)]
 #[tag("items")]
-async fn create_item_route(body: NumericModel, db: Dep<MockDb>) -> TestUser {
+async fn create_item_route(_body: NumericModel, _db: Dep<MockDb>) -> TestUser {
     TestUser { id: 1, name: "item".into() }
 }
 
@@ -421,6 +420,7 @@ async fn default_get_route() -> TestUser {
 }
 
 #[delete("/default-delete/{id}")]
+#[allow(unused_variables)]
 async fn default_delete_route(id: i64) -> () {
     ()
 }
@@ -442,6 +442,7 @@ fn test_default_delete_status() {
 // ---- Issue #1: Query Parameters ----
 
 #[derive(hayai::serde::Deserialize, hayai::schemars::JsonSchema)]
+#[allow(dead_code)]
 struct TestPagination {
     page: Option<i64>,
     limit: Option<i64>,
@@ -478,4 +479,113 @@ fn test_api_error_schema() {
     assert!(schema.properties.contains_key("details"));
     assert!(schema.required.contains(&"error".to_string()));
     assert_eq!(schema.description.as_deref(), Some("Standard API error response"));
+}
+
+// ---- Issue #1 (Vec<T> response) ----
+
+#[get("/vec-test")]
+async fn vec_test_route() -> Vec<TestUser> {
+    vec![TestUser { id: 1, name: "test".into() }]
+}
+
+#[test]
+fn test_vec_response_route_info() {
+    let found = inventory::iter::<hayai::RouteInfo>()
+        .find(|r| r.handler_name == "vec_test_route").unwrap();
+    assert!(found.is_vec_response);
+    assert_eq!(found.vec_inner_type_name, "TestUser");
+}
+
+// ---- Issue #2 (Enum $ref) ----
+
+#[api_model]
+#[derive(Debug, Clone)]
+enum TestStatus {
+    Active,
+    Inactive,
+}
+
+#[api_model]
+#[derive(Debug, Clone)]
+struct ModelWithEnum {
+    name: String,
+    status: TestStatus,
+}
+
+#[test]
+fn test_enum_field_ref() {
+    let schemas: Vec<_> = inventory::iter::<hayai::SchemaInfo>().collect();
+    let info = schemas.iter().find(|s| s.name == "ModelWithEnum").unwrap();
+    let schema = (info.schema_fn)();
+    let status_prop = &schema.properties["status"];
+    assert!(status_prop.ref_path.is_some(), "Enum field should have $ref");
+    assert_eq!(status_prop.ref_path.as_deref().unwrap(), "#/components/schemas/TestStatus");
+}
+
+// ---- Issue #3 (servers) ----
+
+#[test]
+fn test_server_builder() {
+    let app = HayaiApp::new()
+        .title("Test")
+        .server("http://localhost:3000")
+        .server("https://api.example.com");
+    // Just verify it builds without panic
+    let _ = app;
+}
+
+// ---- Issue #6 (response descriptions) ----
+
+#[test]
+fn test_status_description() {
+    assert_eq!(openapi::status_description(200), "OK");
+    assert_eq!(openapi::status_description(201), "Created");
+    assert_eq!(openapi::status_description(204), "No Content");
+    assert_eq!(openapi::status_description(400), "Bad Request");
+    assert_eq!(openapi::status_description(422), "Validation Failed");
+    assert_eq!(openapi::status_description(500), "Internal Server Error");
+}
+
+// ---- Issue #7 (example support) ----
+
+#[api_model]
+#[derive(Debug, Clone)]
+struct ModelWithExample {
+    #[schema(example = "john@example.com")]
+    email: String,
+    name: String,
+}
+
+#[test]
+fn test_example_on_field() {
+    let schemas: Vec<_> = inventory::iter::<hayai::SchemaInfo>().collect();
+    let info = schemas.iter().find(|s| s.name == "ModelWithExample").unwrap();
+    let schema = (info.schema_fn)();
+    let email_prop = &schema.properties["email"];
+    assert_eq!(email_prop.example.as_deref(), Some("john@example.com"));
+    let json = schema.to_json_value();
+    assert_eq!(json["properties"]["email"]["example"], "john@example.com");
+}
+
+// ---- Issue #8 (security) ----
+
+#[get("/secure-test")]
+#[security("bearer")]
+async fn secure_test_route() -> TestUser {
+    TestUser { id: 1, name: "test".into() }
+}
+
+#[test]
+fn test_security_attribute() {
+    let found = inventory::iter::<hayai::RouteInfo>()
+        .find(|r| r.handler_name == "secure_test_route").unwrap();
+    assert_eq!(found.security, &["bearer"]);
+}
+
+#[test]
+fn test_bearer_auth_builder() {
+    let app = HayaiApp::new()
+        .title("Test")
+        .bearer_auth();
+    let _ = app;
 }

@@ -5,9 +5,32 @@ use std::collections::HashMap;
 pub struct OpenApiSpec {
     pub openapi: String,
     pub info: Info,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<Server>,
     pub paths: HashMap<String, HashMap<String, Operation>>,
     #[serde(rename = "components")]
     pub schemas: HashMap<String, Schema>,
+    #[serde(skip)]
+    pub security_schemes: HashMap<String, SecurityScheme>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Server {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SecurityScheme {
+    #[serde(rename = "type")]
+    pub scheme_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
+    #[serde(rename = "bearerFormat", skip_serializing_if = "Option::is_none")]
+    pub bearer_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(rename = "in", skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
 }
 
 impl OpenApiSpec {
@@ -23,6 +46,18 @@ impl OpenApiSpec {
                 "schemas": {}
             }
         });
+
+        if !self.servers.is_empty() {
+            val["servers"] = serde_json::to_value(&self.servers).unwrap();
+        }
+
+        if !self.security_schemes.is_empty() {
+            let mut schemes = serde_json::Map::new();
+            for (name, scheme) in &self.security_schemes {
+                schemes.insert(name.clone(), serde_json::to_value(scheme).unwrap());
+            }
+            val["components"]["securitySchemes"] = serde_json::Value::Object(schemes);
+        }
 
         if let Some(paths) = val["paths"].as_object_mut() {
             for (path, methods) in &self.paths {
@@ -61,6 +96,7 @@ pub struct Operation {
     pub parameters: Vec<Parameter>,
     pub request_body: Option<RequestBody>,
     pub responses: HashMap<String, ResponseDef>,
+    pub security: Vec<HashMap<String, Vec<String>>>,
 }
 
 impl Serialize for Operation {
@@ -75,6 +111,9 @@ impl Serialize for Operation {
         if let Some(rb) = &self.request_body {
             map.serialize_entry("requestBody", &rb.to_json_value())?;
         }
+        if !self.security.is_empty() {
+            map.serialize_entry("security", &self.security)?;
+        }
         let mut resp = serde_json::Map::new();
         for (code, r) in &self.responses {
             let mut obj = serde_json::Map::new();
@@ -82,7 +121,7 @@ impl Serialize for Operation {
             if let Some(schema_ref) = &r.schema_ref {
                 let content = serde_json::json!({
                     "application/json": {
-                        "schema": { "$ref": schema_ref }
+                        "schema": schema_ref
                     }
                 });
                 obj.insert("content".into(), content);
@@ -101,6 +140,8 @@ pub struct Parameter {
     pub location: &'static str,
     pub required: bool,
     pub schema: SchemaObject,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<&'static str>,
 }
 
 /// Dynamic parameter (owned strings, for query params generated at runtime)
@@ -110,6 +151,7 @@ pub struct DynParameter {
     pub location: String,
     pub required: bool,
     pub schema_type: String,
+    pub description: Option<String>,
 }
 
 impl Serialize for DynParameter {
@@ -120,6 +162,9 @@ impl Serialize for DynParameter {
         map.serialize_entry("in", &self.location)?;
         map.serialize_entry("required", &self.required)?;
         map.serialize_entry("schema", &serde_json::json!({"type": self.schema_type}))?;
+        if let Some(desc) = &self.description {
+            map.serialize_entry("description", desc)?;
+        }
         map.end()
     }
 }
@@ -164,7 +209,7 @@ impl RequestBody {
 pub struct ResponseDef {
     pub description: String,
     #[serde(skip)]
-    pub schema_ref: Option<String>,
+    pub schema_ref: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +219,7 @@ pub struct Schema {
     pub required: Vec<String>,
     pub description: Option<String>,
     pub enum_values: Option<Vec<String>>,
+    pub example: Option<String>,
 }
 
 impl Schema {
@@ -228,6 +274,7 @@ pub struct Property {
     pub ref_path: Option<String>,
     pub items: Option<Box<Property>>,
     pub nullable: bool,
+    pub example: Option<String>,
 }
 
 impl Property {
@@ -241,15 +288,13 @@ impl Property {
                     ]
                 });
             }
-            let mut obj = serde_json::json!({ "$ref": ref_path });
             if let Some(desc) = &self.description {
-                // Can't add description to $ref directly in 3.1, wrap in allOf
                 return serde_json::json!({
                     "allOf": [{ "$ref": ref_path }],
                     "description": desc,
                 });
             }
-            return obj;
+            return serde_json::json!({ "$ref": ref_path });
         }
 
         let mut obj = serde_json::Map::new();
@@ -269,6 +314,10 @@ impl Property {
 
         if let Some(desc) = &self.description {
             obj.insert("description".into(), serde_json::Value::String(desc.clone()));
+        }
+
+        if let Some(example) = &self.example {
+            obj.insert("example".into(), serde_json::Value::String(example.clone()));
         }
 
         serde_json::Value::Object(obj)
@@ -317,6 +366,7 @@ pub struct PropertyPatch {
     pub pattern: Option<String>,
     pub min_items: Option<usize>,
     pub description: Option<String>,
+    pub example: Option<String>,
 }
 
 /// Result of schema_from_schemars: the main schema + any nested definitions
@@ -361,6 +411,7 @@ pub fn schema_from_schemars_full(_name: &str, root: &schemars::schema::RootSchem
                     required: def_required,
                     description: None,
                     enum_values: None,
+                    example: None,
                 });
             }
         }
@@ -373,6 +424,7 @@ pub fn schema_from_schemars_full(_name: &str, root: &schemars::schema::RootSchem
             required,
             description: None,
             enum_values: None,
+            example: None,
         },
         nested,
     }
@@ -385,21 +437,49 @@ pub fn query_params_from_schema(root: &schemars::schema::RootSchema) -> Vec<DynP
         let required_set: std::collections::HashSet<&String> = obj.required.iter().collect();
         for (name, prop_schema) in &obj.properties {
             let type_name = schema_type_string(prop_schema);
+            let description = schema_description(prop_schema);
             params.push(DynParameter {
                 name: name.clone(),
                 location: "query".to_string(),
                 required: required_set.contains(name),
                 schema_type: type_name,
+                description,
             });
         }
     }
     params
 }
 
+/// Extract description from a schemars schema
+fn schema_description(schema: &schemars::schema::Schema) -> Option<String> {
+    match schema {
+        schemars::schema::Schema::Object(obj) => {
+            if let Some(meta) = &obj.metadata {
+                return meta.description.clone();
+            }
+            // Check anyOf (Option<T>)
+            if let Some(sub) = &obj.subschemas {
+                if let Some(any_of) = &sub.any_of {
+                    for s in any_of {
+                        if let schemars::schema::Schema::Object(o) = s {
+                            if let Some(meta) = &o.metadata {
+                                if meta.description.is_some() {
+                                    return meta.description.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn schema_type_string(schema: &schemars::schema::Schema) -> String {
     match schema {
         schemars::schema::Schema::Object(obj) => {
-            // Check for anyOf (Option<T>)
             if let Some(sub) = &obj.subschemas {
                 if let Some(any_of) = &sub.any_of {
                     for s in any_of {
@@ -439,7 +519,7 @@ pub fn api_error_schema() -> Schema {
         format: None, min_length: None, max_length: None,
         minimum: None, maximum: None, pattern: None, min_items: None,
         description: Some("Error message".to_string()),
-        ref_path: None, items: None, nullable: false,
+        ref_path: None, items: None, nullable: false, example: None,
     });
     properties.insert("details".to_string(), Property {
         type_name: "array".to_string(),
@@ -451,9 +531,9 @@ pub fn api_error_schema() -> Schema {
             type_name: "string".to_string(),
             format: None, min_length: None, max_length: None,
             minimum: None, maximum: None, pattern: None, min_items: None,
-            description: None, ref_path: None, items: None, nullable: false,
+            description: None, ref_path: None, items: None, nullable: false, example: None,
         })),
-        nullable: false,
+        nullable: false, example: None,
     });
     Schema {
         type_name: "object".to_string(),
@@ -461,6 +541,7 @@ pub fn api_error_schema() -> Schema {
         required: vec!["error".to_string()],
         description: Some("Standard API error response".to_string()),
         enum_values: None,
+        example: None,
     }
 }
 
@@ -478,7 +559,7 @@ fn property_from_schemars_schema(
                     minimum: None, maximum: None, pattern: None, min_items: None,
                     description: None,
                     ref_path: Some(format!("#/components/schemas/{}", ref_name)),
-                    items: None, nullable: false,
+                    items: None, nullable: false, example: None,
                 };
             }
 
@@ -520,12 +601,40 @@ fn property_from_schemars_schema(
                                 type_name: tn,
                                 format: None, min_length: None, max_length: None,
                                 minimum: None, maximum: None, pattern: None, min_items: None,
-                                description: None, ref_path: None, items: None, nullable: true,
+                                description: None, ref_path: None, items: None, nullable: true, example: None,
                             };
                         }
                         tn
                     }
                 };
+
+                // Check if this is a string type that might actually be an enum
+                // by looking at the enum_values in schemars metadata
+                if type_name == "string" {
+                    if let Some(enum_values) = &obj.enum_values {
+                        // This is an inline enum - check if it matches a registered schema
+                        // Try to find the type name from definitions
+                        // For now, check all registered schemas for matching enum values
+                        let enum_strs: Vec<String> = enum_values.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect();
+                        for info in inventory::iter::<crate::SchemaInfo> {
+                            let schema = (info.schema_fn)();
+                            if let Some(ref schema_enums) = schema.enum_values {
+                                if *schema_enums == enum_strs {
+                                    return Property {
+                                        type_name: "string".to_string(),
+                                        format: None, min_length: None, max_length: None,
+                                        minimum: None, maximum: None, pattern: None, min_items: None,
+                                        description: None,
+                                        ref_path: Some(format!("#/components/schemas/{}", info.name)),
+                                        items: None, nullable: false, example: None,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if type_name == "array" {
                     let items_prop = if let Some(arr) = &obj.array {
@@ -541,14 +650,14 @@ fn property_from_schemars_schema(
                     return Property {
                         type_name, format: None, min_length: None, max_length: None,
                         minimum: None, maximum: None, pattern: None, min_items: None,
-                        description: None, ref_path: None, items: items_prop, nullable: false,
+                        description: None, ref_path: None, items: items_prop, nullable: false, example: None,
                     };
                 }
 
                 return Property {
                     type_name, format: None, min_length: None, max_length: None,
                     minimum: None, maximum: None, pattern: None, min_items: None,
-                    description: None, ref_path: None, items: None, nullable: false,
+                    description: None, ref_path: None, items: None, nullable: false, example: None,
                 };
             }
 
@@ -556,14 +665,14 @@ fn property_from_schemars_schema(
                 type_name: "string".to_string(),
                 format: None, min_length: None, max_length: None,
                 minimum: None, maximum: None, pattern: None, min_items: None,
-                description: None, ref_path: None, items: None, nullable: false,
+                description: None, ref_path: None, items: None, nullable: false, example: None,
             }
         }
         _ => Property {
             type_name: "string".to_string(),
             format: None, min_length: None, max_length: None,
             minimum: None, maximum: None, pattern: None, min_items: None,
-            description: None, ref_path: None, items: None, nullable: false,
+            description: None, ref_path: None, items: None, nullable: false, example: None,
         },
     }
 }
@@ -577,5 +686,21 @@ fn format_instance_type(ty: &schemars::schema::InstanceType) -> String {
         schemars::schema::InstanceType::Array => "array".to_string(),
         schemars::schema::InstanceType::Object => "object".to_string(),
         schemars::schema::InstanceType::Null => "null".to_string(),
+    }
+}
+
+/// Map status code to human-readable description
+pub fn status_description(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        422 => "Validation Failed",
+        500 => "Internal Server Error",
+        _ => "Response",
     }
 }
