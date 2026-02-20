@@ -29,6 +29,15 @@ fn is_state_type(ty: &Type) -> bool {
     false
 }
 
+fn is_auth_type(ty: &Type) -> bool {
+    if let Type::Path(tp) = ty {
+        if let Some(seg) = tp.path.segments.last() {
+            return seg.ident == "Auth";
+        }
+    }
+    false
+}
+
 fn is_query_type(ty: &Type) -> bool {
     if let Type::Path(tp) = ty {
         if let Some(seg) = tp.path.segments.last() {
@@ -148,6 +157,9 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
         _ => 200,
     };
     let success_status = status_code.unwrap_or(default_status);
+    let has_auth = input_fn.sig.inputs.iter().any(|arg| {
+        if let FnArg::Typed(PatType { ty, .. }) = arg { is_auth_type(ty) } else { false }
+    });
 
     let path_params: Vec<String> = path.split('/')
         .filter(|s| s.starts_with('{') && s.ends_with('}'))
@@ -189,6 +201,17 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
                         if let Some(inner) = extract_inner_type(seg) {
                             dep_extractions.push(quote! {
                                 let #pat: hayai::State<#inner> = hayai::State::from_app_state(&state)?;
+                            });
+                            call_args.push(quote!(#pat));
+                        }
+                    }
+                }
+            } else if is_auth_type(ty) {
+                if let Type::Path(tp) = ty.as_ref() {
+                    if let Some(seg) = tp.path.segments.last() {
+                        if let Some(inner) = extract_inner_type(seg) {
+                            dep_extractions.push(quote! {
+                                let #pat: hayai::Auth<#inner> = hayai::Auth::from_request_parts(&parts).await?;
                             });
                             call_args.push(quote!(#pat));
                         }
@@ -263,7 +286,7 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
         let bty = body_type.unwrap();
         let bpat = input_fn.sig.inputs.iter().find_map(|arg| {
             if let FnArg::Typed(PatType { pat, ty, .. }) = arg {
-                if !is_dep_type(ty) && !is_primitive_type(ty) && !is_query_type(ty) {
+                if !is_dep_type(ty) && !is_state_type(ty) && !is_auth_type(ty) && !is_primitive_type(ty) && !is_query_type(ty) {
                     let n = quote!(#pat).to_string();
                     if !path_params.contains(&n) { return Some(pat.clone()); }
                 }
@@ -395,6 +418,7 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
             description: #description,
             tags: &[#(#tags),*],
             security: &[#(#security_schemes),*],
+            has_auth: #has_auth,
             query_params_fn: #query_params_fn_expr,
             register_fn: |app: hayai::axum::Router<hayai::AppState>| {
                 app.route(#axum_path, hayai::axum::routing::#method_ident(#wrapper_name))
