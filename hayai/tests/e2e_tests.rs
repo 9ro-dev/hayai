@@ -21,6 +21,22 @@ struct CreateUser {
     email: String,
 }
 
+#[api_model]
+#[derive(Debug, Clone)]
+struct Address {
+    city: String,
+    country: String,
+}
+
+#[api_model]
+#[derive(Debug, Clone)]
+struct UserWithAddress {
+    name: String,
+    address: Address,
+    tags: Vec<String>,
+    nickname: Option<String>,
+}
+
 struct Database;
 impl Database {
     async fn get_user(&self, id: i64) -> Option<User> {
@@ -131,6 +147,30 @@ async fn test_openapi_spec() {
     assert!(body["paths"].as_object().unwrap().contains_key("/users/{id}"));
     assert!(body["paths"].as_object().unwrap().contains_key("/users"));
     assert!(body["components"]["schemas"].as_object().unwrap().contains_key("User"));
+}
+
+#[tokio::test]
+async fn test_openapi_nested_schemas() {
+    let base = spawn_app().await;
+    let resp = reqwest::get(format!("{base}/openapi.json")).await.unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let schemas = &body["components"]["schemas"];
+    
+    // Address should exist as a nested schema
+    assert!(schemas.get("Address").is_some(), "Address schema should be in components/schemas");
+    assert_eq!(schemas["Address"]["type"], "object");
+    assert!(schemas["Address"]["properties"]["city"]["type"] == "string");
+    
+    // UserWithAddress should have $ref for address
+    assert!(schemas.get("UserWithAddress").is_some());
+    assert_eq!(schemas["UserWithAddress"]["properties"]["address"]["$ref"], "#/components/schemas/Address");
+    
+    // tags should be array
+    assert_eq!(schemas["UserWithAddress"]["properties"]["tags"]["type"], "array");
+    assert_eq!(schemas["UserWithAddress"]["properties"]["tags"]["items"]["type"], "string");
+    
+    // nickname should be nullable (anyOf)
+    assert!(schemas["UserWithAddress"]["properties"]["nickname"].get("anyOf").is_some());
 }
 
 #[tokio::test]

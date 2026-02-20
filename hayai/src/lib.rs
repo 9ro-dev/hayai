@@ -134,6 +134,7 @@ inventory::collect!(RouteInfo);
 pub struct SchemaInfo {
     pub name: &'static str,
     pub schema_fn: fn() -> openapi::Schema,
+    pub nested_fn: fn() -> std::collections::HashMap<String, openapi::Schema>,
 }
 
 inventory::collect!(SchemaInfo);
@@ -256,6 +257,10 @@ impl HayaiApp {
         let mut schemas = HashMap::new();
         for info in inventory::iter::<SchemaInfo> {
             schemas.insert(info.name.to_string(), (info.schema_fn)());
+            // Also include nested type definitions (e.g. Address from UserWithAddress)
+            for (nested_name, nested_schema) in (info.nested_fn)() {
+                schemas.entry(nested_name).or_insert(nested_schema);
+            }
         }
         
         let mut paths = HashMap::new();

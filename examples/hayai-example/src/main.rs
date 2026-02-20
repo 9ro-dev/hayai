@@ -17,6 +17,22 @@ struct CreateUser {
     email: String,
 }
 
+#[api_model]
+#[derive(Debug, Clone)]
+struct Address {
+    city: String,
+    country: String,
+}
+
+#[api_model]
+#[derive(Debug, Clone)]
+struct UserProfile {
+    name: String,
+    address: Address,
+    tags: Vec<String>,
+    nickname: Option<String>,
+}
+
 struct Database;
 impl Database {
     async fn get_user(&self, id: i64) -> Option<User> {

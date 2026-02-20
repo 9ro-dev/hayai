@@ -130,6 +130,81 @@ fn test_schema_generation() {
     assert_eq!(email_prop.format.as_deref(), Some("email"));
 }
 
+// ---- Nested Struct / Vec / Option Schema Tests ----
+
+#[api_model]
+#[derive(Debug, Clone)]
+struct Address {
+    city: String,
+    country: String,
+}
+
+#[api_model]
+#[derive(Debug, Clone)]
+struct UserWithAddress {
+    name: String,
+    address: Address,
+    tags: Vec<String>,
+    nickname: Option<String>,
+}
+
+#[test]
+fn test_nested_struct_ref() {
+    let schemas: Vec<_> = inventory::iter::<hayai::SchemaInfo>().collect();
+    let info = schemas.iter().find(|s| s.name == "UserWithAddress").unwrap();
+    let schema = (info.schema_fn)();
+    let addr_prop = &schema.properties["address"];
+    assert!(addr_prop.ref_path.is_some(), "address should have $ref");
+    assert_eq!(addr_prop.ref_path.as_deref().unwrap(), "#/components/schemas/Address");
+}
+
+#[test]
+fn test_vec_string_schema() {
+    let schemas: Vec<_> = inventory::iter::<hayai::SchemaInfo>().collect();
+    let info = schemas.iter().find(|s| s.name == "UserWithAddress").unwrap();
+    let schema = (info.schema_fn)();
+    let tags_prop = &schema.properties["tags"];
+    assert_eq!(tags_prop.type_name, "array");
+    assert!(tags_prop.items.is_some(), "tags should have items");
+    assert_eq!(tags_prop.items.as_ref().unwrap().type_name, "string");
+}
+
+#[test]
+fn test_option_nullable() {
+    let schemas: Vec<_> = inventory::iter::<hayai::SchemaInfo>().collect();
+    let info = schemas.iter().find(|s| s.name == "UserWithAddress").unwrap();
+    let schema = (info.schema_fn)();
+    let nick_prop = &schema.properties["nickname"];
+    assert!(nick_prop.nullable, "nickname should be nullable");
+    assert_eq!(nick_prop.type_name, "string");
+}
+
+#[test]
+fn test_nested_definitions_collected() {
+    let schemas: Vec<_> = inventory::iter::<hayai::SchemaInfo>().collect();
+    let info = schemas.iter().find(|s| s.name == "UserWithAddress").unwrap();
+    let nested = (info.nested_fn)();
+    assert!(nested.contains_key("Address"), "Address should be in nested definitions");
+    let addr_schema = &nested["Address"];
+    assert!(addr_schema.properties.contains_key("city"));
+    assert!(addr_schema.properties.contains_key("country"));
+}
+
+#[test]
+fn test_nested_json_serialization() {
+    let schemas: Vec<_> = inventory::iter::<hayai::SchemaInfo>().collect();
+    let info = schemas.iter().find(|s| s.name == "UserWithAddress").unwrap();
+    let schema = (info.schema_fn)();
+    let json = schema.to_json_value();
+    let addr = &json["properties"]["address"];
+    assert_eq!(addr["$ref"], "#/components/schemas/Address");
+    let tags = &json["properties"]["tags"];
+    assert_eq!(tags["type"], "array");
+    assert_eq!(tags["items"]["type"], "string");
+    let nick = &json["properties"]["nickname"];
+    assert!(nick.get("anyOf").is_some(), "nullable should use anyOf");
+}
+
 // ---- Route Registration Tests ----
 
 struct MockDb;

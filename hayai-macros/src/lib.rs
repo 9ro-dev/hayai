@@ -340,7 +340,8 @@ pub fn api_model(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: #name_str,
                 schema_fn: || {
                     let base = hayai::schemars::schema_for!(#name);
-                    let mut schema = hayai::openapi::schema_from_schemars(#name_str, &base);
+                    let result = hayai::openapi::schema_from_schemars_full(#name_str, &base);
+                    let mut schema = result.schema;
                     let mut patches = std::collections::HashMap::new();
                     for (name, _) in &schema.properties {
                         patches.insert(name.clone(), hayai::openapi::PropertyPatch {
@@ -356,6 +357,11 @@ pub fn api_model(_attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
                     }
                     schema
+                },
+                nested_fn: || {
+                    let base = hayai::schemars::schema_for!(#name);
+                    let result = hayai::openapi::schema_from_schemars_full(#name_str, &base);
+                    result.nested
                 },
             }
         }
