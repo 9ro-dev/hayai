@@ -1,0 +1,3 @@
+[workspace]
+members = ["hayai", "hayai-macros", "examples/hayai-example"]
+resolver = "2"
