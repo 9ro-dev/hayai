@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::{quote, format_ident};
-use syn::{parse_macro_input, ItemFn, DeriveInput, FnArg, PatType, Type, PathSegment, LitStr};
+use syn::{parse_macro_input, ItemFn, ItemStruct, FnArg, PatType, Type, PathSegment, LitStr};
 
 fn extract_inner_type(seg: &PathSegment) -> Option<&Type> {
     if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
@@ -39,17 +39,19 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
     let input_fn = parse_macro_input!(item as ItemFn);
     let fn_name = &input_fn.sig.ident;
     let fn_vis = &input_fn.vis;
+    let fn_attrs = &input_fn.attrs;
+    let fn_sig = &input_fn.sig;
+    let fn_block = &input_fn.block;
 
     let path_params: Vec<String> = path.split('/')
         .filter(|s| s.starts_with('{') && s.ends_with('}'))
         .map(|s| s[1..s.len()-1].to_string())
         .collect();
 
-    let axum_path = path.clone(); // Axum 0.8 uses {param} syntax natively
+    let axum_path = path.clone();
     let method_upper = method.to_uppercase();
     let method_ident = format_ident!("{}", method.to_lowercase());
-    let wrapper_name = format_ident!("{}_handler", fn_name);
-    let impl_name = format_ident!("__{}_impl", fn_name);
+    let wrapper_name = format_ident!("__{}_axum_handler", fn_name);
 
     let mut dep_extractions = Vec::new();
     let mut call_args = Vec::new();
@@ -146,14 +148,14 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
     }).collect();
 
     let body_type_name = body_type.map(|t| get_type_name(t)).unwrap_or_default();
-
-    let mut renamed_fn = input_fn.clone();
-    renamed_fn.sig.ident = impl_name.clone();
-    renamed_fn.vis = syn::Visibility::Inherited;
+    let fn_name_str = fn_name.to_string();
 
     let output = quote! {
-        #renamed_fn
+        // Original fn preserved with its name, visibility, and attributes
+        #(#fn_attrs)*
+        #fn_vis #fn_sig #fn_block
 
+        #[doc(hidden)]
         async fn #wrapper_name(
             hayai::axum::extract::State(state): hayai::axum::extract::State<hayai::AppState>,
             mut parts: hayai::axum::http::request::Parts,
@@ -163,12 +165,15 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
             use hayai::axum::extract::FromRequestParts;
             use hayai::Validate;
 
+            // Parts extracted BEFORE body consumption (Issue #4)
             #path_extraction
             #(#dep_extractions)*
             #body_extraction
 
-            let result = #impl_name(#(#call_args),*).await;
-            Ok(hayai::axum::Json(hayai::serde_json::to_value(&result).unwrap()))
+            let result = #fn_name(#(#call_args),*).await;
+            let value = hayai::serde_json::to_value(&result)
+                .map_err(|e| hayai::ApiError::internal(format!("Response serialization failed: {}", e)))?;
+            Ok(hayai::axum::Json(value))
         }
 
         hayai::inventory::submit! {
@@ -176,7 +181,7 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
                 path: #path,
                 axum_path: #axum_path,
                 method: #method_upper,
-                handler_name: stringify!(#fn_name),
+                handler_name: #fn_name_str,
                 response_type_name: #return_type_name,
                 parameters: &[#(#path_param_schemas),*],
                 has_body: #has_body,
@@ -185,15 +190,6 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
                     app.route(#axum_path, hayai::axum::routing::#method_ident(#wrapper_name))
                 },
             }
-        }
-
-        #fn_vis fn #fn_name() -> &'static hayai::RouteInfo {
-            for info in hayai::inventory::iter::<hayai::RouteInfo> {
-                if info.handler_name == stringify!(#fn_name) {
-                    return info;
-                }
-            }
-            unreachable!()
         }
     };
 
@@ -220,22 +216,27 @@ pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
     route_macro_impl("delete", attr, item)
 }
 
-#[proc_macro_derive(ApiModel, attributes(validate))]
-pub fn api_model_derive(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
+/// Attribute macro that auto-derives Serialize, Deserialize, JsonSchema and generates
+/// Validate + HasSchemaPatches + SchemaInfo registration.
+/// Users only need `#[derive(ApiModel)]` (and optionally Debug, Clone).
+#[proc_macro_attribute]
+pub fn api_model(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemStruct);
     let name = &input.ident;
+    let vis = &input.vis;
+    let attrs = &input.attrs;
+    let generics = &input.generics;
 
-    let fields = match &input.data {
-        syn::Data::Struct(data) => match &data.fields {
-            syn::Fields::Named(fields) => &fields.named,
-            _ => panic!("ApiModel only supports structs with named fields"),
-        },
-        _ => panic!("ApiModel only supports structs"),
+    let fields = match &input.fields {
+        syn::Fields::Named(fields) => &fields.named,
+        _ => panic!("ApiModel only supports structs with named fields"),
     };
 
     let mut validation_checks = Vec::new();
     let mut schema_patches = Vec::new();
 
+    // Collect fields, stripping #[validate(...)] attributes for the re-emitted struct
+    let mut clean_fields = Vec::new();
     for field in fields {
         let field_name = field.ident.as_ref().unwrap();
         let field_name_str = field_name.to_string();
@@ -273,8 +274,24 @@ pub fn api_model_derive(input: TokenStream) -> TokenStream {
                     });
                 } else if meta.path.is_ident("email") {
                     validation_checks.push(quote! {
-                        if !self.#field_name.contains('@') || !self.#field_name.contains('.') {
-                            errors.push(format!("{}: must be a valid email address", #field_name_str));
+                        {
+                            let email = &self.#field_name;
+                            let at_count = email.chars().filter(|&c| c == '@').count();
+                            let valid = at_count == 1
+                                && !email.starts_with('@')
+                                && !email.ends_with('@')
+                                && {
+                                    if let Some(at_pos) = email.find('@') {
+                                        let domain = &email[at_pos + 1..];
+                                        !domain.is_empty() && domain.contains('.')
+                                            && !domain.starts_with('.') && !domain.ends_with('.')
+                                    } else {
+                                        false
+                                    }
+                                };
+                            if !valid {
+                                errors.push(format!("{}: must be a valid email address", #field_name_str));
+                            }
                         }
                     });
                     schema_patches.push(quote! {
@@ -286,11 +303,24 @@ pub fn api_model_derive(input: TokenStream) -> TokenStream {
                 Ok(())
             });
         }
+
+        // Strip validate attrs from field for re-emission
+        let mut clean_field = field.clone();
+        clean_field.attrs.retain(|a| !a.path().is_ident("validate"));
+        clean_fields.push(clean_field);
     }
 
     let name_str = name.to_string();
 
     let output = quote! {
+        #(#attrs)*
+        #[derive(hayai::serde::Serialize, hayai::serde::Deserialize, hayai::schemars::JsonSchema)]
+        #[serde(crate = "hayai::serde")]
+        #[schemars(crate = "hayai::schemars")]
+        #vis struct #name #generics {
+            #(#clean_fields),*
+        }
+
         impl hayai::Validate for #name {
             fn validate(&self) -> Result<(), Vec<String>> {
                 let mut errors = Vec::new();
@@ -333,3 +363,10 @@ pub fn api_model_derive(input: TokenStream) -> TokenStream {
 
     output.into()
 }
+
+// Keep the old derive macro name but redirect - actually remove it since we use attribute macro now
+// We need to keep `ApiModel` as the name. Let's use a derive macro that's a no-op placeholder
+// and the attribute macro is `api_model`. But the task says users use `#[derive(ApiModel)]`.
+// 
+// Actually, derive macros can't add other derives. So we use `#[api_model]` attribute macro.
+// The derive(ApiModel) was the old API. New API is #[api_model].

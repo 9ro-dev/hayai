@@ -1,16 +1,16 @@
 use hayai::prelude::*;
 use hayai::openapi;
-use serde::{Serialize, Deserialize};
-use schemars::JsonSchema;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ApiModel)]
+#[api_model]
+#[derive(Debug, Clone)]
 struct TestUser {
     id: i64,
     name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ApiModel)]
+#[api_model]
+#[derive(Debug, Clone)]
 struct CreateTestUser {
     #[validate(min_length = 1, max_length = 50)]
     name: String,
@@ -50,10 +50,50 @@ fn test_validation_max_length() {
 }
 
 #[test]
-fn test_validation_email() {
+fn test_validation_email_missing_at() {
     let user = CreateTestUser {
         name: "Alice".into(),
         email: "notanemail".into(),
+    };
+    let err = user.validate().unwrap_err();
+    assert!(err.iter().any(|e| e.contains("valid email")));
+}
+
+#[test]
+fn test_validation_email_at_start() {
+    let user = CreateTestUser {
+        name: "Alice".into(),
+        email: "@example.com".into(),
+    };
+    let err = user.validate().unwrap_err();
+    assert!(err.iter().any(|e| e.contains("valid email")));
+}
+
+#[test]
+fn test_validation_email_at_end() {
+    let user = CreateTestUser {
+        name: "Alice".into(),
+        email: "user@".into(),
+    };
+    let err = user.validate().unwrap_err();
+    assert!(err.iter().any(|e| e.contains("valid email")));
+}
+
+#[test]
+fn test_validation_email_no_dot_in_domain() {
+    let user = CreateTestUser {
+        name: "Alice".into(),
+        email: "user@localhost".into(),
+    };
+    let err = user.validate().unwrap_err();
+    assert!(err.iter().any(|e| e.contains("valid email")));
+}
+
+#[test]
+fn test_validation_email_multiple_at() {
+    let user = CreateTestUser {
+        name: "Alice".into(),
+        email: "user@@example.com".into(),
     };
     let err = user.validate().unwrap_err();
     assert!(err.iter().any(|e| e.contains("valid email")));
@@ -73,7 +113,6 @@ fn test_validation_multiple_errors() {
 
 #[test]
 fn test_schema_generation() {
-    // Check that SchemaInfo is registered via inventory
     let schemas: Vec<_> = inventory::iter::<hayai::SchemaInfo>().collect();
     let test_user_schema = schemas.iter().find(|s| s.name == "CreateTestUser");
     assert!(test_user_schema.is_some(), "CreateTestUser schema should be registered");
@@ -83,7 +122,6 @@ fn test_schema_generation() {
     assert!(schema.properties.contains_key("name"));
     assert!(schema.properties.contains_key("email"));
     
-    // Check validation constraints in schema
     let name_prop = &schema.properties["name"];
     assert_eq!(name_prop.min_length, Some(1));
     assert_eq!(name_prop.max_length, Some(50));
@@ -103,7 +141,10 @@ async fn test_get_route(id: i64, db: Dep<MockDb>) -> TestUser {
 
 #[test]
 fn test_route_info_registered() {
-    let info = test_get_route();
+    let found = inventory::iter::<hayai::RouteInfo>()
+        .find(|r| r.handler_name == "test_get_route");
+    assert!(found.is_some(), "test_get_route should be registered");
+    let info = found.unwrap();
     assert_eq!(info.path, "/test/{id}");
     assert_eq!(info.method, "GET");
     assert_eq!(info.response_type_name, "TestUser");
@@ -115,11 +156,11 @@ fn test_route_info_registered() {
 
 #[test]
 fn test_app_builder() {
-    let app = HayaiApp::new()
-        .dep(MockDb)
-        .route(test_get_route);
+    let _app = HayaiApp::new()
+        .title("Test API")
+        .version("0.1.0")
+        .dep(MockDb);
     // If we got here, builder works
-    assert!(true);
 }
 
 // ---- API Error Tests ----

@@ -26,19 +26,25 @@ impl OpenApiSpec {
         });
         
         // Build paths
-        let paths = val["paths"].as_object_mut().unwrap();
-        for (path, methods) in &self.paths {
-            let mut path_obj = serde_json::Map::new();
-            for (method, op) in methods {
-                path_obj.insert(method.clone(), serde_json::to_value(op).unwrap());
+        if let Some(paths) = val["paths"].as_object_mut() {
+            for (path, methods) in &self.paths {
+                let mut path_obj = serde_json::Map::new();
+                for (method, op) in methods {
+                    if let Ok(v) = serde_json::to_value(op) {
+                        path_obj.insert(method.clone(), v);
+                    }
+                }
+                paths.insert(path.clone(), serde_json::Value::Object(path_obj));
             }
-            paths.insert(path.clone(), serde_json::Value::Object(path_obj));
         }
         
         // Build schemas
-        let schemas = val["components"]["schemas"].as_object_mut().unwrap();
-        for (name, schema) in &self.schemas {
-            schemas.insert(name.clone(), serde_json::to_value(schema).unwrap());
+        if let Some(schemas) = val.pointer_mut("/components/schemas").and_then(|v| v.as_object_mut()) {
+            for (name, schema) in &self.schemas {
+                if let Ok(v) = serde_json::to_value(schema) {
+                    schemas.insert(name.clone(), v);
+                }
+            }
         }
         
         val

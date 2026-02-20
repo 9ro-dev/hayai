@@ -1,15 +1,15 @@
 use hayai::prelude::*;
-use serde::{Serialize, Deserialize};
-use schemars::JsonSchema;
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ApiModel)]
+#[api_model]
+#[derive(Debug, Clone)]
 struct User {
     id: i64,
     name: String,
     email: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, ApiModel)]
+#[api_model]
+#[derive(Debug, Clone)]
 struct CreateUser {
     #[validate(min_length = 1, max_length = 100)]
     name: String,
@@ -49,9 +49,9 @@ async fn create_user(body: CreateUser, db: Dep<Database>) -> User {
 #[tokio::main]
 async fn main() {
     HayaiApp::new()
+        .title("My API")
+        .version("1.0.0")
         .dep(Database)
-        .route(get_user)
-        .route(create_user)
         .serve("0.0.0.0:3000")
         .await;
 }
