@@ -388,9 +388,9 @@ async fn spawn_router_app() -> String {
     let items = hayai::HayaiRouter::new("/api/items")
         .tag("items")
         .security("bearer")
-        .route(E2E_LIST_ITEMS)
-        .route(E2E_GET_ITEM)
-        .route(E2E_DELETE_ITEM);
+        .route(__HAYAI_ROUTE_E2E_LIST_ITEMS)
+        .route(__HAYAI_ROUTE_E2E_GET_ITEM)
+        .route(__HAYAI_ROUTE_E2E_DELETE_ITEM);
 
     let app = HayaiApp::new()
         .title("Router Test API")
@@ -464,7 +464,7 @@ async fn test_router_e2e_original_path_not_registered() {
 #[tokio::test]
 async fn test_router_e2e_nested_routers() {
     let items = hayai::HayaiRouter::new("/items")
-        .route(E2E_LIST_ITEMS);
+        .route(__HAYAI_ROUTE_E2E_LIST_ITEMS);
     let v1 = hayai::HayaiRouter::new("/v1")
         .include(items);
     let api = hayai::HayaiRouter::new("/api")

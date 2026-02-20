@@ -15,6 +15,7 @@ pub use serde_json;
 pub use schemars;
 pub use inventory;
 pub use axum;
+pub use regex;
 
 pub mod prelude {
     pub use crate::{get, post, put, delete, api_model};
@@ -60,9 +61,10 @@ impl AppState {
 pub struct Dep<T: 'static + Send + Sync>(Arc<T>);
 
 impl<T: 'static + Send + Sync> Dep<T> {
-    pub fn from_app_state(state: &AppState) -> Self {
-        let arc = state.get::<T>().expect("Dependency not registered");
-        Dep(arc)
+    pub fn from_app_state(state: &AppState) -> Result<Self, ApiError> {
+        state.get::<T>()
+            .map(Dep)
+            .ok_or_else(|| ApiError::internal(format!("Dependency not registered: {}", std::any::type_name::<T>())))
     }
 }
 

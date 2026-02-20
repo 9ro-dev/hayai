@@ -807,8 +807,8 @@ async fn rt_secured_route() -> RouterTestItem {
 #[test]
 fn test_router_prefix_prepended() {
     let router = hayai::HayaiRouter::new("/api/items")
-        .route(RT_LIST_ITEMS)
-        .route(RT_GET_ITEM);
+        .route(__HAYAI_ROUTE_RT_LIST_ITEMS)
+        .route(__HAYAI_ROUTE_RT_GET_ITEM);
     let resolved = router.resolve("", &[], &[]);
     assert_eq!(resolved.len(), 2);
     assert_eq!(resolved[0].full_path(), "/api/items/rt-list");
@@ -818,7 +818,7 @@ fn test_router_prefix_prepended() {
 #[test]
 fn test_nested_router_prefix_concatenation() {
     let inner = hayai::HayaiRouter::new("/items")
-        .route(RT_LIST_ITEMS);
+        .route(__HAYAI_ROUTE_RT_LIST_ITEMS);
     let outer = hayai::HayaiRouter::new("/api/v1")
         .include(inner);
     let resolved = outer.resolve("", &[], &[]);
@@ -830,7 +830,7 @@ fn test_nested_router_prefix_concatenation() {
 fn test_router_tags_merged_with_route_tags() {
     let router = hayai::HayaiRouter::new("/tagged")
         .tag("router-tag")
-        .route(RT_TAGGED_ROUTE);
+        .route(__HAYAI_ROUTE_RT_TAGGED_ROUTE);
     let resolved = router.resolve("", &[], &[]);
     assert_eq!(resolved.len(), 1);
     let tags = resolved[0].merged_tags();
@@ -842,7 +842,7 @@ fn test_router_tags_merged_with_route_tags() {
 fn test_router_security_applied() {
     let router = hayai::HayaiRouter::new("/secure")
         .security("api_key")
-        .route(RT_SECURED_ROUTE);
+        .route(__HAYAI_ROUTE_RT_SECURED_ROUTE);
     let resolved = router.resolve("", &[], &[]);
     let sec = resolved[0].merged_security();
     assert!(sec.contains(&"api_key"));
@@ -859,7 +859,7 @@ fn test_router_no_include_backward_compat() {
 #[test]
 fn test_router_with_include_is_explicit() {
     let router = hayai::HayaiRouter::new("/items")
-        .route(RT_LIST_ITEMS);
+        .route(__HAYAI_ROUTE_RT_LIST_ITEMS);
     let app = hayai::HayaiApp::new().include(router);
     assert!(app.has_explicit_routes());
 }
@@ -867,7 +867,7 @@ fn test_router_with_include_is_explicit() {
 #[test]
 fn test_deeply_nested_routers() {
     let items = hayai::HayaiRouter::new("/items")
-        .route(RT_GET_ITEM);
+        .route(__HAYAI_ROUTE_RT_GET_ITEM);
     let v1 = hayai::HayaiRouter::new("/v1")
         .include(items);
     let api = hayai::HayaiRouter::new("/api")
@@ -880,7 +880,7 @@ fn test_deeply_nested_routers() {
 #[test]
 fn test_router_tags_security_propagate_through_nesting() {
     let inner = hayai::HayaiRouter::new("/items")
-        .route(RT_LIST_ITEMS);
+        .route(__HAYAI_ROUTE_RT_LIST_ITEMS);
     let outer = hayai::HayaiRouter::new("/api")
         .tag("api")
         .security("bearer")
@@ -896,8 +896,8 @@ fn test_router_tags_security_propagate_through_nesting() {
 fn test_router_openapi_spec_prefixed_paths() {
     let router = hayai::HayaiRouter::new("/api/items")
         .tag("items")
-        .route(RT_LIST_ITEMS)
-        .route(RT_GET_ITEM);
+        .route(__HAYAI_ROUTE_RT_LIST_ITEMS)
+        .route(__HAYAI_ROUTE_RT_GET_ITEM);
     let app = hayai::HayaiApp::new()
         .include(router);
     let _router_axum = app.into_router();
@@ -908,9 +908,9 @@ fn test_router_openapi_spec_prefixed_paths() {
 #[test]
 fn test_multiple_routers_on_app() {
     let items = hayai::HayaiRouter::new("/items")
-        .route(RT_LIST_ITEMS);
+        .route(__HAYAI_ROUTE_RT_LIST_ITEMS);
     let secure = hayai::HayaiRouter::new("/secure")
-        .route(RT_SECURED_ROUTE);
+        .route(__HAYAI_ROUTE_RT_SECURED_ROUTE);
     let app = hayai::HayaiApp::new()
         .include(items)
         .include(secure);
@@ -918,4 +918,65 @@ fn test_multiple_routers_on_app() {
     assert_eq!(resolved.len(), 2);
     assert_eq!(resolved[0].full_path(), "/items/rt-list");
     assert_eq!(resolved[1].full_path(), "/secure/rt-secured");
+}
+
+// ---- Fix #1: Missing dep returns error, not panic ----
+
+#[tokio::test]
+async fn test_missing_dep_returns_500_not_panic() {
+    // Build app WITHOUT registering MockDb, but with a route that needs it
+    let router = hayai::HayaiRouter::new("/test")
+        .route(__HAYAI_ROUTE_TEST_GET_ROUTE);
+    let app = HayaiApp::new()
+        .include(router)
+        .into_router();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        hayai::axum::serve(listener, app).await.unwrap();
+    });
+
+    let resp = reqwest::get(format!("http://{}/test/test/42", addr)).await.unwrap();
+    assert_eq!(resp.status(), 500);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("Dependency not registered"));
+}
+
+// ---- Fix #2: String path param gets "string" type ----
+
+#[get("/by-name/{name}")]
+async fn get_by_name(name: String) -> TestUser {
+    TestUser { id: 0, name }
+}
+
+#[test]
+fn test_string_path_param_type() {
+    let found = inventory::iter::<&hayai::RouteInfo>()
+        .find(|r| r.handler_name == "get_by_name").unwrap();
+    assert_eq!(found.parameters.len(), 1);
+    assert_eq!(found.parameters[0].name, "name");
+    assert_eq!(found.parameters[0].schema.type_name, "string");
+}
+
+#[test]
+fn test_integer_path_param_type() {
+    let found = inventory::iter::<&hayai::RouteInfo>()
+        .find(|r| r.handler_name == "test_get_route").unwrap();
+    assert_eq!(found.parameters[0].schema.type_name, "integer");
+}
+
+// ---- Fix #5: Pattern validation rejects non-matching input ----
+
+#[test]
+fn test_pattern_validation_rejects_non_matching() {
+    let m = NumericModel { quantity: 50, code: "abc".into(), items: vec!["a".into()] };
+    let err = m.validate().unwrap_err();
+    assert!(err.iter().any(|e| e.contains("must match pattern")));
+}
+
+#[test]
+fn test_pattern_validation_accepts_matching() {
+    let m = NumericModel { quantity: 50, code: "ABC".into(), items: vec!["a".into()] };
+    assert!(m.validate().is_ok());
 }

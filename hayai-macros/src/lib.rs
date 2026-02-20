@@ -134,7 +134,7 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
     let method_ident = format_ident!("{}", method.to_lowercase());
     let wrapper_name = format_ident!("__{}_axum_handler", fn_name);
     let route_info_name = format_ident!("__{}_route_info", fn_name);
-    let route_ref_name = format_ident!("{}", fn_name.to_string().to_uppercase());
+    let route_ref_name = format_ident!("__HAYAI_ROUTE_{}", fn_name.to_string().to_uppercase());
 
     let mut dep_extractions = Vec::new();
     let mut call_args = Vec::new();
@@ -152,7 +152,7 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
                     if let Some(seg) = tp.path.segments.last() {
                         if let Some(inner) = extract_inner_type(seg) {
                             dep_extractions.push(quote! {
-                                let #pat: hayai::Dep<#inner> = hayai::Dep::from_app_state(&state);
+                                let #pat: hayai::Dep<#inner> = hayai::Dep::from_app_state(&state)?;
                             });
                             call_args.push(quote!(#pat));
                         }
@@ -259,12 +259,26 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
     };
 
     let path_param_schemas: Vec<_> = path_params.iter().map(|p| {
+        // Find the type of this path param
+        let openapi_type = path_param_types.iter()
+            .find(|(name, _)| name.to_string() == *p)
+            .map(|(_, ty)| {
+                let type_name = get_type_name(ty);
+                match type_name.as_str() {
+                    "i8"|"i16"|"i32"|"i64"|"i128"|"u8"|"u16"|"u32"|"u64"|"u128" => "integer",
+                    "f32"|"f64" => "number",
+                    "String" => "string",
+                    "bool" => "boolean",
+                    _ => "string",
+                }
+            })
+            .unwrap_or("string");
         quote! {
             hayai::openapi::Parameter {
                 name: #p,
                 location: "path",
                 required: true,
-                schema: hayai::openapi::SchemaObject::new_type("integer"),
+                schema: hayai::openapi::SchemaObject::new_type(#openapi_type),
                 description: None,
             }
         }
@@ -408,16 +422,22 @@ fn api_model_enum(input: ItemEnum) -> TokenStream {
             hayai::SchemaInfo {
                 name: #name_str,
                 schema_fn: || {
-                    hayai::openapi::Schema {
-                        type_name: "string".to_string(),
-                        properties: std::collections::HashMap::new(),
-                        required: vec![],
-                        description: #desc_expr,
-                        enum_values: Some(vec![#(#variant_names.to_string()),*]),
-                        example: None,
-                    }
+                    static CACHE: std::sync::OnceLock<hayai::openapi::Schema> = std::sync::OnceLock::new();
+                    CACHE.get_or_init(|| {
+                        hayai::openapi::Schema {
+                            type_name: "string".to_string(),
+                            properties: std::collections::HashMap::new(),
+                            required: vec![],
+                            description: #desc_expr,
+                            enum_values: Some(vec![#(#variant_names.to_string()),*]),
+                            example: None,
+                        }
+                    }).clone()
                 },
-                nested_fn: || std::collections::HashMap::new(),
+                nested_fn: || {
+                    static CACHE: std::sync::OnceLock<std::collections::HashMap<String, hayai::openapi::Schema>> = std::sync::OnceLock::new();
+                    CACHE.get_or_init(|| std::collections::HashMap::new()).clone()
+                },
             }
         }
     };
@@ -547,6 +567,15 @@ fn api_model_struct(input: ItemStruct) -> TokenStream {
                         let value = meta.value()?;
                         let lit: syn::LitStr = value.parse()?;
                         let pat = lit.value();
+                        validation_checks.push(quote! {
+                            {
+                                static RE: std::sync::OnceLock<hayai::regex::Regex> = std::sync::OnceLock::new();
+                                let re = RE.get_or_init(|| hayai::regex::Regex::new(#pat).expect("Invalid regex"));
+                                if !re.is_match(&self.#field_name) {
+                                    errors.push(format!("{}: must match pattern {}", #field_name_str, #pat));
+                                }
+                            }
+                        });
                         schema_patches.push(quote! {
                             if let Some(prop) = props.get_mut(#field_name_str) {
                                 prop.pattern = Some(#pat.to_string());
@@ -626,38 +655,44 @@ fn api_model_struct(input: ItemStruct) -> TokenStream {
             hayai::SchemaInfo {
                 name: #name_str,
                 schema_fn: || {
-                    let base = hayai::schemars::schema_for!(#name);
-                    let result = hayai::openapi::schema_from_schemars_full(#name_str, &base);
-                    let mut schema = result.schema;
-                    schema.description = #desc_expr;
-                    let mut patches = std::collections::HashMap::new();
-                    for (name, _) in &schema.properties {
-                        patches.insert(name.clone(), hayai::openapi::PropertyPatch {
-                            min_length: None, max_length: None, format: None,
-                            minimum: None, maximum: None, pattern: None, min_items: None,
-                            description: None, example: None,
-                        });
-                    }
-                    <#name as hayai::HasSchemaPatches>::patch_schema(&mut patches);
-                    for (name, patch) in patches {
-                        if let Some(prop) = schema.properties.get_mut(&name) {
-                            if patch.min_length.is_some() { prop.min_length = patch.min_length; }
-                            if patch.max_length.is_some() { prop.max_length = patch.max_length; }
-                            if patch.format.is_some() { prop.format = patch.format; }
-                            if patch.minimum.is_some() { prop.minimum = patch.minimum; }
-                            if patch.maximum.is_some() { prop.maximum = patch.maximum; }
-                            if patch.pattern.is_some() { prop.pattern = patch.pattern.clone(); }
-                            if patch.min_items.is_some() { prop.min_items = patch.min_items; }
-                            if patch.description.is_some() { prop.description = patch.description.clone(); }
-                            if patch.example.is_some() { prop.example = patch.example.clone(); }
+                    static CACHE: std::sync::OnceLock<hayai::openapi::Schema> = std::sync::OnceLock::new();
+                    CACHE.get_or_init(|| {
+                        let base = hayai::schemars::schema_for!(#name);
+                        let result = hayai::openapi::schema_from_schemars_full(#name_str, &base);
+                        let mut schema = result.schema;
+                        schema.description = #desc_expr;
+                        let mut patches = std::collections::HashMap::new();
+                        for (name, _) in &schema.properties {
+                            patches.insert(name.clone(), hayai::openapi::PropertyPatch {
+                                min_length: None, max_length: None, format: None,
+                                minimum: None, maximum: None, pattern: None, min_items: None,
+                                description: None, example: None,
+                            });
                         }
-                    }
-                    schema
+                        <#name as hayai::HasSchemaPatches>::patch_schema(&mut patches);
+                        for (name, patch) in patches {
+                            if let Some(prop) = schema.properties.get_mut(&name) {
+                                if patch.min_length.is_some() { prop.min_length = patch.min_length; }
+                                if patch.max_length.is_some() { prop.max_length = patch.max_length; }
+                                if patch.format.is_some() { prop.format = patch.format; }
+                                if patch.minimum.is_some() { prop.minimum = patch.minimum; }
+                                if patch.maximum.is_some() { prop.maximum = patch.maximum; }
+                                if patch.pattern.is_some() { prop.pattern = patch.pattern.clone(); }
+                                if patch.min_items.is_some() { prop.min_items = patch.min_items; }
+                                if patch.description.is_some() { prop.description = patch.description.clone(); }
+                                if patch.example.is_some() { prop.example = patch.example.clone(); }
+                            }
+                        }
+                        schema
+                    }).clone()
                 },
                 nested_fn: || {
-                    let base = hayai::schemars::schema_for!(#name);
-                    let result = hayai::openapi::schema_from_schemars_full(#name_str, &base);
-                    result.nested
+                    static CACHE: std::sync::OnceLock<std::collections::HashMap<String, hayai::openapi::Schema>> = std::sync::OnceLock::new();
+                    CACHE.get_or_init(|| {
+                        let base = hayai::schemars::schema_for!(#name);
+                        let result = hayai::openapi::schema_from_schemars_full(#name_str, &base);
+                        result.nested
+                    }).clone()
                 },
             }
         }

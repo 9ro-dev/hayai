@@ -146,16 +146,16 @@ fn user_routes() -> HayaiRouter {
     HayaiRouter::new("/users")
         .tag("users")
         .security("bearer")
-        .route(GET_USER)
-        .route(LIST_USERS)
-        .route(CREATE_USER)
-        .route(DELETE_USER)
+        .route(__HAYAI_ROUTE_GET_USER)
+        .route(__HAYAI_ROUTE_LIST_USERS)
+        .route(__HAYAI_ROUTE_CREATE_USER)
+        .route(__HAYAI_ROUTE_DELETE_USER)
 }
 
 fn item_routes() -> HayaiRouter {
     HayaiRouter::new("/items")
         .tag("items")
-        .route(CREATE_ITEM)
+        .route(__HAYAI_ROUTE_CREATE_ITEM)
 }
 
 #[tokio::main]
