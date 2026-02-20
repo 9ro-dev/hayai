@@ -359,3 +359,128 @@ async fn test_openapi_response_descriptions() {
     let post_user = &body["paths"]["/users"]["post"];
     assert_eq!(post_user["responses"]["201"]["description"], "Created");
 }
+
+// ===== Router E2E tests =====
+
+#[api_model]
+#[derive(Debug, Clone)]
+struct Item {
+    id: i64,
+    name: String,
+}
+
+#[get("/e2e-rt-list")]
+async fn e2e_list_items() -> Vec<Item> {
+    vec![Item { id: 1, name: "Widget".into() }]
+}
+
+#[get("/e2e-rt-item/{id}")]
+async fn e2e_get_item(id: i64) -> Item {
+    Item { id, name: "Widget".into() }
+}
+
+#[delete("/e2e-rt-del/{id}")]
+async fn e2e_delete_item(id: i64) -> () {
+    let _ = id;
+}
+
+async fn spawn_router_app() -> String {
+    let items = hayai::HayaiRouter::new("/api/items")
+        .tag("items")
+        .security("bearer")
+        .route(E2E_LIST_ITEMS)
+        .route(E2E_GET_ITEM)
+        .route(E2E_DELETE_ITEM);
+
+    let app = HayaiApp::new()
+        .title("Router Test API")
+        .version("0.1.0")
+        .bearer_auth()
+        .include(items)
+        .into_router();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+#[tokio::test]
+async fn test_router_e2e_get_prefixed_path() {
+    let base = spawn_router_app().await;
+    let resp = reqwest::get(format!("{base}/api/items/e2e-rt-item/42")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], 42);
+    assert_eq!(body["name"], "Widget");
+}
+
+#[tokio::test]
+async fn test_router_e2e_list_prefixed_path() {
+    let base = spawn_router_app().await;
+    let resp = reqwest::get(format!("{base}/api/items/e2e-rt-list")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert!(body.as_array().unwrap().len() > 0);
+}
+
+#[tokio::test]
+async fn test_router_e2e_delete_returns_204() {
+    let base = spawn_router_app().await;
+    let client = reqwest::Client::new();
+    let resp = client.delete(format!("{base}/api/items/e2e-rt-del/1")).send().await.unwrap();
+    assert_eq!(resp.status(), 204);
+}
+
+#[tokio::test]
+async fn test_router_e2e_openapi_prefixed_paths() {
+    let base = spawn_router_app().await;
+    let resp = reqwest::get(format!("{base}/openapi.json")).await.unwrap();
+    let body: Value = resp.json().await.unwrap();
+
+    // Paths should be prefixed
+    assert!(body["paths"]["/api/items/e2e-rt-list"]["get"].is_object());
+    assert!(body["paths"]["/api/items/e2e-rt-item/{id}"]["get"].is_object());
+
+    // Tags should include router-level tag
+    let tags = body["paths"]["/api/items/e2e-rt-list"]["get"]["tags"].as_array().unwrap();
+    assert!(tags.iter().any(|t| t == "items"));
+
+    // Security should include router-level security
+    let sec = body["paths"]["/api/items/e2e-rt-list"]["get"]["security"].as_array().unwrap();
+    assert!(sec.iter().any(|s| s.get("bearerAuth").is_some()));
+}
+
+#[tokio::test]
+async fn test_router_e2e_original_path_not_registered() {
+    let base = spawn_router_app().await;
+    // The original unprefixed path should NOT exist
+    let resp = reqwest::get(format!("{base}/e2e-rt-list")).await.unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn test_router_e2e_nested_routers() {
+    let items = hayai::HayaiRouter::new("/items")
+        .route(E2E_LIST_ITEMS);
+    let v1 = hayai::HayaiRouter::new("/v1")
+        .include(items);
+    let api = hayai::HayaiRouter::new("/api")
+        .include(v1);
+
+    let app = HayaiApp::new()
+        .include(api)
+        .into_router();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+
+    let resp = reqwest::get(format!("{base}/api/v1/items/e2e-rt-list")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}

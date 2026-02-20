@@ -113,35 +113,49 @@ impl Database {
 }
 
 /// Get a user by ID
-#[get("/users/{id}")]
-#[tag("users")]
-#[security("bearer")]
+#[get("/{id}")]
 async fn get_user(id: i64, db: Dep<Database>) -> User {
     db.get_user(id).await.unwrap()
 }
 
 /// List all users with pagination
-#[get("/users")]
-#[tag("users")]
-#[security("bearer")]
+#[get("/")]
 async fn list_users(query: Query<Pagination>, db: Dep<Database>) -> Vec<User> {
     db.list_users(query.page, query.limit).await
 }
 
 /// Create a new user
-#[post("/users")]
-#[tag("users")]
-#[security("bearer")]
+#[post("/")]
 async fn create_user(body: CreateUser, db: Dep<Database>) -> User {
     db.create_user(&body).await
 }
 
 /// Delete a user by ID
-#[delete("/users/{id}")]
-#[tag("users")]
-#[security("bearer")]
+#[delete("/{id}")]
 async fn delete_user(id: i64, db: Dep<Database>) -> () {
     db.delete_user(id).await
+}
+
+/// Create a new item
+#[post("/")]
+async fn create_item(body: CreateItem) -> CreateItem {
+    body
+}
+
+fn user_routes() -> HayaiRouter {
+    HayaiRouter::new("/users")
+        .tag("users")
+        .security("bearer")
+        .route(GET_USER)
+        .route(LIST_USERS)
+        .route(CREATE_USER)
+        .route(DELETE_USER)
+}
+
+fn item_routes() -> HayaiRouter {
+    HayaiRouter::new("/items")
+        .tag("items")
+        .route(CREATE_ITEM)
 }
 
 #[tokio::main]
@@ -155,6 +169,8 @@ async fn main() {
         .server("http://localhost:3001")
         .bearer_auth()
         .dep(Database)
+        .include(user_routes())
+        .include(item_routes())
         .serve("0.0.0.0:3001")
         .await;
 }

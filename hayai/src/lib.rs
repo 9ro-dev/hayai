@@ -18,7 +18,7 @@ pub use axum;
 
 pub mod prelude {
     pub use crate::{get, post, put, delete, api_model};
-    pub use crate::{HayaiApp, Dep, ApiError, Validate};
+    pub use crate::{HayaiApp, HayaiRouter, Dep, ApiError, Validate};
     pub use crate::axum::extract::Query;
 }
 
@@ -131,9 +131,10 @@ pub struct RouteInfo {
     pub security: &'static [&'static str],
     pub query_params_fn: Option<fn() -> Vec<openapi::DynParameter>>,
     pub register_fn: fn(Router<AppState>) -> Router<AppState>,
+    pub method_router_fn: fn() -> axum::routing::MethodRouter<AppState>,
 }
 
-inventory::collect!(RouteInfo);
+inventory::collect!(&'static RouteInfo);
 
 /// Schema information collected by api_model attribute
 pub struct SchemaInfo {
@@ -143,6 +144,151 @@ pub struct SchemaInfo {
 }
 
 inventory::collect!(SchemaInfo);
+
+/// A resolved route with runtime prefix and merged tags/security
+pub struct ResolvedRoute {
+    pub route_info: &'static RouteInfo,
+    pub prefix: String,
+    pub extra_tags: Vec<String>,
+    pub extra_security: Vec<String>,
+}
+
+impl ResolvedRoute {
+    /// Full path = prefix + route's original path
+    pub fn full_path(&self) -> String {
+        let base = self.route_info.path;
+        if self.prefix.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}{}", self.prefix, base)
+        }
+    }
+
+    /// Full axum path = prefix + route's original axum_path
+    pub fn full_axum_path(&self) -> String {
+        let base = self.route_info.axum_path;
+        if self.prefix.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}{}", self.prefix, base)
+        }
+    }
+
+    /// Merged tags: router-level + route-level
+    pub fn merged_tags(&self) -> Vec<String> {
+        let mut tags: Vec<String> = self.extra_tags.clone();
+        for t in self.route_info.tags {
+            if !tags.contains(&t.to_string()) {
+                tags.push(t.to_string());
+            }
+        }
+        tags
+    }
+
+    /// Merged security: router-level + route-level
+    pub fn merged_security(&self) -> Vec<&str> {
+        let mut sec: Vec<&str> = self.extra_security.iter().map(|s| s.as_str()).collect();
+        for s in self.route_info.security {
+            if !sec.contains(s) {
+                sec.push(s);
+            }
+        }
+        sec
+    }
+}
+
+/// A FastAPI-style router with prefix, shared tags, security, deps, and nested routers
+pub struct HayaiRouter {
+    prefix: String,
+    routes: Vec<&'static RouteInfo>,
+    tags: Vec<String>,
+    security: Vec<String>,
+    deps: HashMap<TypeId, Arc<dyn Any + Send + Sync>>,
+    children: Vec<HayaiRouter>,
+}
+
+impl HayaiRouter {
+    pub fn new(prefix: &str) -> Self {
+        Self {
+            prefix: prefix.to_string(),
+            routes: Vec::new(),
+            tags: Vec::new(),
+            security: Vec::new(),
+            deps: HashMap::new(),
+            children: Vec::new(),
+        }
+    }
+
+    pub fn route(mut self, route: &'static RouteInfo) -> Self {
+        self.routes.push(route);
+        self
+    }
+
+    pub fn tag(mut self, tag: &str) -> Self {
+        self.tags.push(tag.to_string());
+        self
+    }
+
+    pub fn security(mut self, scheme: &str) -> Self {
+        self.security.push(scheme.to_string());
+        self
+    }
+
+    pub fn dep<T: 'static + Send + Sync>(mut self, dep: T) -> Self {
+        self.deps.insert(TypeId::of::<T>(), Arc::new(dep));
+        self
+    }
+
+    pub fn include(mut self, child: HayaiRouter) -> Self {
+        self.children.push(child);
+        self
+    }
+
+    /// Flatten this router tree into resolved routes, accumulating prefix/tags/security
+    pub fn resolve(
+        &self,
+        parent_prefix: &str,
+        parent_tags: &[String],
+        parent_security: &[String],
+    ) -> Vec<ResolvedRoute> {
+        let full_prefix = format!("{}{}", parent_prefix, self.prefix);
+        let mut merged_tags: Vec<String> = parent_tags.to_vec();
+        for t in &self.tags {
+            if !merged_tags.contains(t) {
+                merged_tags.push(t.clone());
+            }
+        }
+        let mut merged_security: Vec<String> = parent_security.to_vec();
+        for s in &self.security {
+            if !merged_security.contains(s) {
+                merged_security.push(s.clone());
+            }
+        }
+
+        let mut resolved = Vec::new();
+        for route in &self.routes {
+            resolved.push(ResolvedRoute {
+                route_info: route,
+                prefix: full_prefix.clone(),
+                extra_tags: merged_tags.clone(),
+                extra_security: merged_security.clone(),
+            });
+        }
+        for child in &self.children {
+            resolved.extend(child.resolve(&full_prefix, &merged_tags, &merged_security));
+        }
+        resolved
+    }
+
+    /// Collect all deps from this router tree
+    pub fn collect_deps(&self) -> HashMap<TypeId, Arc<dyn Any + Send + Sync>> {
+        let mut all = self.deps.clone();
+        for child in &self.children {
+            all.extend(child.collect_deps());
+        }
+        all
+    }
+}
 
 /// Swagger UI serving mode
 #[derive(Debug, Clone)]
@@ -164,6 +310,7 @@ pub struct HayaiApp {
     swagger_mode: SwaggerMode,
     servers: Vec<openapi::Server>,
     security_schemes: HashMap<String, openapi::SecurityScheme>,
+    routers: Vec<HayaiRouter>,
 }
 
 impl HayaiApp {
@@ -178,6 +325,7 @@ impl HayaiApp {
             swagger_mode: SwaggerMode::Embedded,
             servers: Vec::new(),
             security_schemes: HashMap::new(),
+            routers: Vec::new(),
         }
     }
 
@@ -248,20 +396,55 @@ impl HayaiApp {
         })
     }
 
+    pub fn include(mut self, router: HayaiRouter) -> Self {
+        self.routers.push(router);
+        self
+    }
+
+    /// Check if routers were explicitly included
+    pub fn has_explicit_routes(&self) -> bool {
+        !self.routers.is_empty()
+    }
+
+    /// Resolve all routes from included routers
+    pub fn resolve_routes(&self) -> Vec<ResolvedRoute> {
+        let mut resolved = Vec::new();
+        for router in &self.routers {
+            resolved.extend(router.resolve("", &[], &[]));
+        }
+        resolved
+    }
+
     pub fn into_router(self) -> Router {
         let spec = self.generate_openapi_spec();
         let swagger_html = self.generate_swagger_html();
+        let has_explicit = self.has_explicit_routes();
+        let resolved = if has_explicit { self.resolve_routes() } else { Vec::new() };
+        let spec_json = serde_json::to_string_pretty(&spec.to_json_with_query_params(&self.routers))
+            .expect("Failed to serialize OpenAPI spec");
+
+        // Merge deps from routers
+        let mut all_deps = self.deps;
+        for router in &self.routers {
+            all_deps.extend(router.collect_deps());
+        }
 
         let state = AppState {
-            deps: Arc::new(self.deps),
+            deps: Arc::new(all_deps),
         };
-        let spec_json = serde_json::to_string_pretty(&spec.to_json_with_query_params())
-            .expect("Failed to serialize OpenAPI spec");
 
         let mut app = Router::new();
 
-        for route in inventory::iter::<RouteInfo> {
-            app = (route.register_fn)(app);
+        if has_explicit {
+            for r in &resolved {
+                let axum_path = r.full_axum_path();
+                let method_router = (r.route_info.method_router_fn)();
+                app = app.route(&axum_path, method_router);
+            }
+        } else {
+            for route in inventory::iter::<&RouteInfo> {
+                app = (route.register_fn)(app);
+            }
         }
 
         let spec_json_clone = spec_json.clone();
@@ -291,6 +474,79 @@ impl HayaiApp {
         println!("📖 Swagger UI available at http://{}/docs", addr);
         axum::serve(listener, app).await
             .expect("Server error");
+    }
+
+    fn build_operation(route: &RouteInfo, tags: Vec<String>, security_list: &[&str]) -> openapi::Operation {
+        let description = if route.description.is_empty() {
+            None
+        } else {
+            Some(route.description.to_string())
+        };
+
+        let status_code = route.success_status.to_string();
+
+        let security: Vec<HashMap<String, Vec<String>>> = security_list.iter().map(|s| {
+            let scheme_name = match *s {
+                "bearer" => "bearerAuth",
+                other => other,
+            };
+            let mut map = HashMap::new();
+            map.insert(scheme_name.to_string(), vec![]);
+            map
+        }).collect();
+
+        let schema_ref_value = if route.success_status == 204 {
+            None
+        } else if route.is_vec_response {
+            Some(serde_json::json!({
+                "type": "array",
+                "items": { "$ref": format!("#/components/schemas/{}", route.vec_inner_type_name) }
+            }))
+        } else {
+            Some(serde_json::json!({ "$ref": format!("#/components/schemas/{}", route.response_type_name) }))
+        };
+
+        let success_desc = openapi::status_description(route.success_status).to_string();
+
+        openapi::Operation {
+            summary: Some(route.handler_name.replace('_', " ")),
+            description,
+            operation_id: Some(route.handler_name.to_string()),
+            tags,
+            parameters: route.parameters.to_vec(),
+            request_body: if route.has_body {
+                Some(openapi::RequestBody {
+                    required: true,
+                    content_type: "application/json".to_string(),
+                    schema_ref: format!("#/components/schemas/{}", route.body_type_name),
+                })
+            } else {
+                None
+            },
+            responses: {
+                let mut map = HashMap::new();
+                map.insert(status_code, openapi::ResponseDef {
+                    description: success_desc,
+                    schema_ref: schema_ref_value,
+                });
+                map.insert("400".to_string(), openapi::ResponseDef {
+                    description: "Bad Request".to_string(),
+                    schema_ref: Some(serde_json::json!({ "$ref": "#/components/schemas/ApiError" })),
+                });
+                if route.has_body {
+                    map.insert("422".to_string(), openapi::ResponseDef {
+                        description: "Validation Failed".to_string(),
+                        schema_ref: Some(serde_json::json!({ "$ref": "#/components/schemas/ApiError" })),
+                    });
+                }
+                map.insert("500".to_string(), openapi::ResponseDef {
+                    description: "Internal Server Error".to_string(),
+                    schema_ref: Some(serde_json::json!({ "$ref": "#/components/schemas/ApiError" })),
+                });
+                map
+            },
+            security,
+        }
     }
 
     fn generate_swagger_html(&self) -> String {
@@ -357,89 +613,26 @@ impl HayaiApp {
         }
 
         let mut paths = HashMap::new();
-        for route in inventory::iter::<RouteInfo> {
-            let description = if route.description.is_empty() {
-                None
-            } else {
-                Some(route.description.to_string())
-            };
 
-            let tags: Vec<String> = route.tags.iter().map(|s| s.to_string()).collect();
-
-            let status_code = route.success_status.to_string();
-
-            // Build security requirements for this operation
-            let security: Vec<HashMap<String, Vec<String>>> = route.security.iter().map(|s| {
-                let scheme_name = match *s {
-                    "bearer" => "bearerAuth",
-                    other => other,
-                };
-                let mut map = HashMap::new();
-                map.insert(scheme_name.to_string(), vec![]);
-                map
-            }).collect();
-
-            // Build response schema ref
-            let schema_ref_value = if route.success_status == 204 {
-                None
-            } else if route.is_vec_response {
-                // Array response: inline array schema with $ref items
-                Some(serde_json::json!({
-                    "type": "array",
-                    "items": { "$ref": format!("#/components/schemas/{}", route.vec_inner_type_name) }
-                }))
-            } else {
-                Some(serde_json::json!({ "$ref": format!("#/components/schemas/{}", route.response_type_name) }))
-            };
-
-            let success_desc = openapi::status_description(route.success_status).to_string();
-
-            let operation = openapi::Operation {
-                summary: Some(route.handler_name.replace('_', " ")),
-                description,
-                operation_id: Some(route.handler_name.to_string()),
-                tags,
-                parameters: route.parameters.to_vec(),
-                request_body: if route.has_body {
-                    Some(openapi::RequestBody {
-                        required: true,
-                        content_type: "application/json".to_string(),
-                        schema_ref: format!("#/components/schemas/{}", route.body_type_name),
-                    })
-                } else {
-                    None
-                },
-                responses: {
-                    let mut map = HashMap::new();
-
-                    map.insert(status_code, openapi::ResponseDef {
-                        description: success_desc,
-                        schema_ref: schema_ref_value,
-                    });
-
-                    // Error responses
-                    map.insert("400".to_string(), openapi::ResponseDef {
-                        description: "Bad Request".to_string(),
-                        schema_ref: Some(serde_json::json!({ "$ref": "#/components/schemas/ApiError" })),
-                    });
-                    if route.has_body {
-                        map.insert("422".to_string(), openapi::ResponseDef {
-                            description: "Validation Failed".to_string(),
-                            schema_ref: Some(serde_json::json!({ "$ref": "#/components/schemas/ApiError" })),
-                        });
-                    }
-                    map.insert("500".to_string(), openapi::ResponseDef {
-                        description: "Internal Server Error".to_string(),
-                        schema_ref: Some(serde_json::json!({ "$ref": "#/components/schemas/ApiError" })),
-                    });
-
-                    map
-                },
-                security,
-            };
-
-            let path_item = paths.entry(route.path.to_string()).or_insert_with(HashMap::new);
-            path_item.insert(route.method.to_lowercase(), operation);
+        if self.has_explicit_routes() {
+            let resolved = self.resolve_routes();
+            for r in &resolved {
+                let route = r.route_info;
+                let full_path = r.full_path();
+                let tags = r.merged_tags();
+                let sec = r.merged_security();
+                let operation = Self::build_operation(route, tags, &sec);
+                let path_item = paths.entry(full_path).or_insert_with(HashMap::new);
+                path_item.insert(route.method.to_lowercase(), operation);
+            }
+        } else {
+            for route in inventory::iter::<&RouteInfo> {
+                let tags: Vec<String> = route.tags.iter().map(|s| s.to_string()).collect();
+                let sec: Vec<&str> = route.security.iter().copied().collect();
+                let operation = Self::build_operation(route, tags, &sec);
+                let path_item = paths.entry(route.path.to_string()).or_insert_with(HashMap::new);
+                path_item.insert(route.method.to_lowercase(), operation);
+            }
         }
 
         openapi::OpenApiSpec {
@@ -461,18 +654,51 @@ impl HayaiApp {
 
 impl openapi::OpenApiSpec {
     /// Enhanced to_json that includes dynamic query parameters
-    pub fn to_json_with_query_params(&self) -> serde_json::Value {
+    pub fn to_json_with_query_params(&self, routers: &[HayaiRouter]) -> serde_json::Value {
         let mut val = self.to_json();
 
-        // Inject query params from RouteInfo
-        for route in inventory::iter::<RouteInfo> {
-            if let Some(qfn) = route.query_params_fn {
+        // Build path mapping: for each route, determine the actual spec path
+        let use_routers = !routers.is_empty();
+
+        struct RoutePathInfo {
+            spec_path: String,
+            method: String,
+            query_params_fn: Option<fn() -> Vec<openapi::DynParameter>>,
+        }
+
+        let mut route_paths = Vec::new();
+
+        if use_routers {
+            for router in routers {
+                let resolved = router.resolve("", &[], &[]);
+                for r in &resolved {
+                    if let Some(qfn) = r.route_info.query_params_fn {
+                        route_paths.push(RoutePathInfo {
+                            spec_path: r.full_path(),
+                            method: r.route_info.method.to_lowercase(),
+                            query_params_fn: Some(qfn),
+                        });
+                    }
+                }
+            }
+        } else {
+            for route in inventory::iter::<&RouteInfo> {
+                if let Some(qfn) = route.query_params_fn {
+                    route_paths.push(RoutePathInfo {
+                        spec_path: route.path.to_string(),
+                        method: route.method.to_lowercase(),
+                        query_params_fn: Some(qfn),
+                    });
+                }
+            }
+        }
+
+        for rp in &route_paths {
+            if let Some(qfn) = rp.query_params_fn {
                 let dyn_params = qfn();
                 if !dyn_params.is_empty() {
-                    let method = route.method.to_lowercase();
-                    let path = route.path;
-                    let escaped = path.replace('~', "~0").replace('/', "~1");
-                    let pointer = format!("/paths/{}/{}", escaped, method);
+                    let escaped = rp.spec_path.replace('~', "~0").replace('/', "~1");
+                    let pointer = format!("/paths/{}/{}", escaped, rp.method);
                     if let Some(op) = val.pointer_mut(&pointer) {
                         let params = op.get("parameters")
                             .and_then(|v| v.as_array())

@@ -133,6 +133,8 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
     let method_upper = method.to_uppercase();
     let method_ident = format_ident!("{}", method.to_lowercase());
     let wrapper_name = format_ident!("__{}_axum_handler", fn_name);
+    let route_info_name = format_ident!("__{}_route_info", fn_name);
+    let route_ref_name = format_ident!("{}", fn_name.to_string().to_uppercase());
 
     let mut dep_extractions = Vec::new();
     let mut call_args = Vec::new();
@@ -303,28 +305,36 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
             #response_expr
         }
 
-        hayai::inventory::submit! {
-            hayai::RouteInfo {
-                path: #path,
-                axum_path: #axum_path,
-                method: #method_upper,
-                handler_name: #fn_name_str,
-                response_type_name: #return_type_name,
-                is_vec_response: #is_vec_response,
-                vec_inner_type_name: #vec_inner_type_name,
-                parameters: &[#(#path_param_schemas),*],
-                has_body: #has_body,
-                body_type_name: #body_type_name,
-                success_status: #status_lit,
-                description: #description,
-                tags: &[#(#tags),*],
-                security: &[#(#security_schemes),*],
-                query_params_fn: #query_params_fn_expr,
-                register_fn: |app: hayai::axum::Router<hayai::AppState>| {
-                    app.route(#axum_path, hayai::axum::routing::#method_ident(#wrapper_name))
-                },
-            }
-        }
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        static #route_info_name: hayai::RouteInfo = hayai::RouteInfo {
+            path: #path,
+            axum_path: #axum_path,
+            method: #method_upper,
+            handler_name: #fn_name_str,
+            response_type_name: #return_type_name,
+            is_vec_response: #is_vec_response,
+            vec_inner_type_name: #vec_inner_type_name,
+            parameters: &[#(#path_param_schemas),*],
+            has_body: #has_body,
+            body_type_name: #body_type_name,
+            success_status: #status_lit,
+            description: #description,
+            tags: &[#(#tags),*],
+            security: &[#(#security_schemes),*],
+            query_params_fn: #query_params_fn_expr,
+            register_fn: |app: hayai::axum::Router<hayai::AppState>| {
+                app.route(#axum_path, hayai::axum::routing::#method_ident(#wrapper_name))
+            },
+            method_router_fn: || {
+                hayai::axum::routing::#method_ident(#wrapper_name)
+            },
+        };
+
+        #[doc(hidden)]
+        pub static #route_ref_name: &hayai::RouteInfo = &#route_info_name;
+
+        hayai::inventory::submit! { &#route_info_name }
     };
 
     output.into()
