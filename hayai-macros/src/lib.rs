@@ -211,7 +211,7 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
                     if let Some(seg) = tp.path.segments.last() {
                         if let Some(inner) = extract_inner_type(seg) {
                             dep_extractions.push(quote! {
-                                let #pat: hayai::Auth<#inner> = hayai::Auth::from_request_parts(&parts).await?;
+                                let #pat: hayai::Auth<#inner> = hayai::Auth::from_request_parts(&state, &mut parts).await?;
                             });
                             call_args.push(quote!(#pat));
                         }

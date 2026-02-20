@@ -112,6 +112,24 @@ impl Database {
     async fn delete_user(&self, _id: i64) {}
 }
 
+/// Custom auth validator that accepts API keys starting with "sk-"
+#[derive(Clone)]
+struct ApiKeyValidator;
+
+#[async_trait::async_trait]
+impl AuthValidator for ApiKeyValidator {
+    type Credentials = String;
+
+    async fn validate(&self, token: &str) -> Result<Self::Credentials, ApiError> {
+        // Accept tokens starting with "sk-" for demo
+        if token.starts_with("sk-") {
+            Ok(token.to_string())
+        } else {
+            Err(ApiError::unauthorized("Invalid API key - must start with 'sk-'"))
+        }
+    }
+}
+
 /// Get a user by ID
 #[get("/{id}")]
 async fn get_user(id: i64, db: Dep<Database>) -> Result<User, ApiError> {
@@ -143,6 +161,14 @@ async fn create_item(body: CreateItem) -> CreateItem {
     body
 }
 
+/// Protected route that requires authentication
+/// Uses the ApiKeyValidator to verify the Authorization header
+#[get("/protected")]
+#[security("bearer")]
+async fn protected_route(auth: Auth<ApiKeyValidator>) -> String {
+    format!("Hello, authenticated user! Your key: {}", auth.user)
+}
+
 fn user_routes() -> HayaiRouter {
     HayaiRouter::new("/users")
         .tag("users")
@@ -151,6 +177,7 @@ fn user_routes() -> HayaiRouter {
         .route(__HAYAI_ROUTE_LIST_USERS)
         .route(__HAYAI_ROUTE_CREATE_USER)
         .route(__HAYAI_ROUTE_DELETE_USER)
+        .route(__HAYAI_ROUTE_PROTECTED_ROUTE)
 }
 
 fn item_routes() -> HayaiRouter {
@@ -170,6 +197,7 @@ async fn main() {
         .server("http://localhost:3001")
         .bearer_auth()
         .dep(Database)
+        .dep(ApiKeyValidator)  // Register the auth validator
         .include(user_routes())
         .include(item_routes())
         .serve("0.0.0.0:3001")

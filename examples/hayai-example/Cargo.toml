@@ -8,3 +8,4 @@ hayai = { path = "../../hayai" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 schemars = "0.8"
+async-trait = "0.1"

@@ -19,7 +19,8 @@ pub use regex;
 
 pub mod prelude {
     pub use crate::{get, post, put, delete, api_model};
-    pub use crate::{HayaiApp, HayaiRouter, Dep, State, ApiError, Validate};
+    pub use crate::{HayaiApp, HayaiRouter, Dep, State, Auth, ApiError, Validate};
+    pub use crate::{AuthValidator, ApiKeyValidator};
     pub use crate::axum::extract::Query;
 }
 
@@ -95,6 +96,121 @@ impl<T: 'static + Send + Sync> std::ops::Deref for State<T> {
     }
 }
 
+/// Authentication extractor - verifies Bearer tokens or API keys
+/// 
+/// The generic type T should implement the AuthValidator trait to define
+/// how authentication is performed.
+/// 
+/// # Example
+/// 
+/// ```ignore
+/// #[derive(Clone)]
+/// struct ApiKeyValidator;
+///
+/// #[hayai::async_trait]
+/// impl AuthValidator for ApiKeyValidator {
+///     type Credentials = String;
+///
+///     async fn validate(&self, credentials: &Self::Credentials) -> Result<User, ApiError> {
+///         // Validate the API key and return the authenticated user
+///         if credentials.starts_with("sk-") {
+///             Ok(User { id: 1, name: "admin".into() })
+///         } else {
+///             Err(ApiError::unauthorized("Invalid API key"))
+///         }
+///     }
+/// }
+///
+/// #[get("/protected")]
+/// async fn protected_route(auth: Auth<ApiKeyValidator>) -> String {
+///     format!("Hello, {}!", auth.user.name)
+/// }
+/// ```
+pub struct Auth<T: 'static + Send + Sync + AuthValidator> {
+    pub user: <T as AuthValidator>::Credentials,
+    _marker: std::marker::PhantomData<T>,
+}
+
+/// Trait for implementing custom authentication logic
+#[async_trait::async_trait]
+pub trait AuthValidator: Send + Sync {
+    /// The type of credentials after successful authentication
+    type Credentials: Send + Sync;
+    
+    /// Validate credentials from the request
+    /// Returns Ok(credentials) on success, Err(ApiError) on failure
+    /// The input is a string slice from the Authorization header
+    async fn validate(&self, token: &str) -> Result<Self::Credentials, ApiError>;
+}
+
+/// Default auth validator for simple API key validation
+#[derive(Clone)]
+pub struct ApiKeyValidator;
+
+#[async_trait::async_trait]
+impl AuthValidator for ApiKeyValidator {
+    type Credentials = String;
+
+    async fn validate(&self, token: &str) -> Result<Self::Credentials, ApiError> {
+        // Simple validation: accept any non-empty key for demo
+        // In production, you'd validate against a database or service
+        if token.is_empty() {
+            Err(ApiError::unauthorized("Empty API key"))
+        } else {
+            Ok(token.to_string())
+        }
+    }
+}
+
+impl<T> Auth<T>
+where
+    T: AuthValidator + Send + Sync + 'static,
+{
+    /// Create Auth from AppState and request parts
+    /// This is called by the generated route wrapper code
+    pub async fn from_request_parts(
+        state: &AppState,
+        parts: &mut axum::http::request::Parts,
+    ) -> Result<Self, ApiError> {
+        // Get the validator from app state
+        let validator = state.get::<T>()
+            .ok_or_else(|| ApiError::internal("Auth validator not registered in app state".to_string()))?;
+
+        // Get the authorization header (note: headers is a field, not a method in axum::http 1.x)
+        let auth_header = parts
+            .headers
+            .get("authorization")
+            .and_then(|v: &axum::http::HeaderValue| v.to_str().ok())
+            .map(|s: &str| s.to_string())
+            .or_else(|| {
+                // Also check for X-API-Key header
+                parts
+                    .headers
+                    .get("x-api-key")
+                    .and_then(|v: &axum::http::HeaderValue| v.to_str().ok())
+                    .map(|s: &str| s.to_string())
+            });
+
+        let credentials = auth_header
+            .ok_or_else(|| ApiError::unauthorized("Missing authorization header"))?;
+
+        // Extract the credential value (handle Bearer token or API key)
+        let credential_value = if credentials.starts_with("Bearer ") {
+            credentials.strip_prefix("Bearer ").unwrap_or(&credentials).to_string()
+        } else {
+            credentials
+        };
+
+        // Validate the credentials
+        let validated = validator.validate(credential_value.as_str()).await?;
+
+        Ok(Auth {
+            user: validated,
+            _marker: std::marker::PhantomData,
+        })
+    }
+}
+
 /// API Error type
 #[derive(Debug, Serialize)]
 pub struct ApiError {
@@ -156,6 +272,8 @@ pub struct RouteInfo {
     pub description: &'static str,
     pub tags: &'static [&'static str],
     pub security: &'static [&'static str],
+    /// Whether this route requires authentication (derived from Auth<T> extractor usage)
+    pub has_auth: bool,
     pub query_params_fn: Option<fn() -> Vec<openapi::DynParameter>>,
     pub register_fn: fn(Router<AppState>) -> Router<AppState>,
     pub method_router_fn: fn() -> axum::routing::MethodRouter<AppState>,
@@ -463,7 +581,7 @@ impl HayaiApp {
         self
     }
 
-    pub fn bearer_auth(self) -> Self {
+        pub fn bearer_auth(self) -> Self {
         self.security_scheme("bearerAuth", openapi::SecurityScheme {
             scheme_type: "http".to_string(),
             scheme: Some("bearer".to_string()),
@@ -619,6 +737,13 @@ impl HayaiApp {
                 if route.has_body {
                     map.insert("422".to_string(), openapi::ResponseDef {
                         description: "Validation Failed".to_string(),
+                        schema_ref: Some(serde_json::json!({ "$ref": "#/components/schemas/ApiError" })),
+                    });
+                }
+                // Add 401 response for secured routes (has security requirements)
+                if !security_list.is_empty() || route.has_auth {
+                    map.insert("401".to_string(), openapi::ResponseDef {
+                        description: "Unauthorized - Missing or invalid authentication".to_string(),
                         schema_ref: Some(serde_json::json!({ "$ref": "#/components/schemas/ApiError" })),
                     });
                 }
