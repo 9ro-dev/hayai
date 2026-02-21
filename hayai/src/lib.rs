@@ -1,3 +1,148 @@
+/*!
+# Hayai - A FastAPI-inspired Web Framework for Rust
+
+Hayai is a lightweight, FastAPI-inspired web framework built on top of Axum with first-class OpenAPI/Swagger support.
+
+## Features
+
+- **Declarative routing** - Define routes using proc macro attributes
+- **Auto-generated OpenAPI specs** - Automatic OpenAPI 3.1 documentation
+- **Dependency injection** - First-class support for typed dependencies
+- **Request validation** - Built-in validation with `validate_response = true` strict mode
+- **WebSocket support** - WebSocket endpoints with `#[websocket]` attribute
+- **Lifecycle hooks** - Startup/shutdown callbacks with `Lifespan`
+- **Schema generation** - Automatic JSON Schema generation from Rust types
+
+## Quick Start
+
+```rust
+use hayai::{get, HayaiApp};
+
+#[get("/hello")]
+fn hello() -> String {
+    "Hello, World!".into()
+}
+
+#[tokio::main]
+async fn main() {
+    HayaiApp::new()
+        .title("My API")
+        .version("1.0.0")
+        .include(hayai::HayaiRouter::new("").route(hello::__HAYAI_ROUTE_hello))
+        .serve("127.0.0.1:3000")
+        .await;
+}
+```
+
+## Feature Examples
+
+### WebSocket Support
+
+```rust
+use hayai::{websocket, HayaiApp};
+use axum::extract::ws::{WebSocket, Message};
+
+#[websocket("/ws")]
+async fn echo_handler(ws: WebSocket) {
+    let (mut sender, mut receiver) = ws.split();
+    while let Some(msg) = receiver.recv().await {
+        if let Ok(text) = msg.to_str() {
+            let _ = sender.send(Message::Text(format!("echo: {}", text))).await;
+        }
+    }
+}
+```
+
+### Lifespan Support (Startup/Shutdown Hooks)
+
+```rust
+use hayai::{HayaiApp, Lifespan, LifespanSharedState};
+
+#[tokio::main]
+async fn main() {
+    let lifespan = Lifespan::new()
+        .on_startup(|state: LifespanSharedState| {
+            Box::pin(async {
+                println!("🚀 Server starting up!");
+                // Initialize connections, databases, etc.
+            })
+        })
+        .on_shutdown(|state: LifespanSharedState| {
+            Box::pin(async {
+                println!("🛑 Server shutting down!");
+                // Cleanup resources
+            })
+        });
+
+    HayaiApp::new()
+        .title("My API")
+        .version("1.0.0")
+        .serve("127.0.0.1:3000")
+        .await;
+}
+```
+
+### Strict Mode: Response Validation
+
+Enable `validate_response = true` to validate your response types against their OpenAPI schema:
+
+```rust
+use hayai::{get, HayaiApp, Validate};
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct User {
+    pub id: u64,
+    pub name: String,
+    pub email: String,
+}
+
+impl Validate for User {
+    fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if self.email.is_empty() {
+            errors.push("email is required".into());
+        }
+        if self.name.is_empty() {
+            errors.push("name is required".into());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+#[get("/users/{id}", validate_response = true)]
+async fn get_user(Path(id): Path<u64>) -> Result<User, ApiError> {
+    Ok(User {
+        id,
+        name: "John".into(),
+        email: "john@example.com".into(),
+    })
+}
+```
+
+### Dependency Injection
+
+```rust
+use hayai::{get, Dep, HayaiApp, AppState};
+
+pub struct DbPool {
+    // Database connection pool
+}
+
+impl DbPool {
+    pub fn new() -> Self { Self {} }
+}
+
+#[get("/users")]
+async fn list_users(dep: Dep<DbPool>) -> Result<Vec<User>, ApiError> {
+    // Use dep.0 to access DbPool
+    Ok(vec![])
+}
+*/
+
 pub mod openapi;
 
 use axum::Router;
