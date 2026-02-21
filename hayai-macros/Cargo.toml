@@ -2,6 +2,11 @@
 name = "hayai-macros"
 version = "0.1.0"
 edition = "2021"
+description = "Procedural macros for the Hayai web framework"
+license = "MIT"
+repository = "https://github.com/9ro-dev/hayai"
+keywords = ["axum", "fastapi", "openapi", "web", "async", "macros"]
+categories = ["asynchronous", "web-programming", "api-bindings"]
 
 [lib]
 proc-macro = true

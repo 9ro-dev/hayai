@@ -2,6 +2,11 @@
 name = "hayai"
 version = "0.1.0"
 edition = "2021"
+description = "A FastAPI-inspired web framework for Rust with OpenAPI support"
+license = "MIT"
+repository = "https://github.com/9ro-dev/hayai"
+keywords = ["axum", "fastapi", "openapi", "web", "async", "swagger"]
+categories = ["asynchronous", "web-programming", "api-bindings"]
 
 [dependencies]
 hayai-macros = { path = "../hayai-macros" }
