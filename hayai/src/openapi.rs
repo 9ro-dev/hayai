@@ -128,6 +128,8 @@ pub struct Operation {
     pub request_body: Option<RequestBody>,
     pub responses: HashMap<String, ResponseDef>,
     pub security: Vec<HashMap<String, Vec<String>>>,
+    /// Custom extensions (e.g., for WebSocket)
+    pub extensions: Option<serde_json::Value>,
 }
 
 impl Serialize for Operation {
@@ -160,6 +162,11 @@ impl Serialize for Operation {
             resp.insert(code.clone(), serde_json::Value::Object(obj));
         }
         map.serialize_entry("responses", &resp)?;
+        if let Some(ext) = &self.extensions {
+            for (key, value) in ext.as_object().unwrap() {
+                map.serialize_entry(key, value)?;
+            }
+        }
         map.end()
     }
 }

@@ -29,6 +29,24 @@ fn is_query_type(ty: &Type) -> bool {
     false
 }
 
+fn is_upload_file_type(ty: &Type) -> bool {
+    if let Type::Path(tp) = ty {
+        if let Some(seg) = tp.path.segments.last() {
+            return seg.ident == "UploadFile";
+        }
+    }
+    false
+}
+
+fn is_form_type(ty: &Type) -> bool {
+    if let Type::Path(tp) = ty {
+        if let Some(seg) = tp.path.segments.last() {
+            return seg.ident == "Form";
+        }
+    }
+    false
+}
+
 fn get_type_name(ty: &Type) -> String {
     if let Type::Path(tp) = ty {
         if let Some(seg) = tp.path.segments.last() {
@@ -372,6 +390,64 @@ pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
     route_macro_impl("delete", attr, item)
+}
+
+/// WebSocket handler macro
+/// 
+/// Example:
+/// ```ignore
+/// #[websocket("/ws")]
+/// async fn echo_handler(ws: WebSocket) {
+///     let (mut sender, mut receiver) = ws.split();
+///     while let Some(msg) = receiver.recv().await {
+///         if let Ok(text) = msg.to_str() {
+///             let _ = sender.send(Message::Text(format!("echo: {}", text))).await;
+///         }
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn websocket(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let path = parse_macro_input!(attr as LitStr).value();
+    let input_fn = parse_macro_input!(item as ItemFn);
+    let fn_name = &input_fn.sig.ident;
+    let fn_vis = &input_fn.vis;
+    let fn_sig = &input_fn.sig;
+    let fn_block = &input_fn.block;
+    
+    // Extract doc comment for description
+    let description = extract_doc_comment(&input_fn.attrs);
+    
+    let fn_name_str = fn_name.to_string();
+    
+    let output = quote! {
+        #fn_vis #fn_sig #fn_block
+        
+        #[doc(hidden)]
+        async fn #fn_name _ws_handler(
+            hayai::axum::extract::State(state): hayai::axum::extract::State<hayai::AppState>,
+            ws: hayai::axum::extract::ws::WebSocket,
+        ) -> Result<hayai::axum::response::Response, hayai::ApiError> {
+            #fn_name(ws).await;
+            Ok(hayai::axum::response::Response::new(hayai::axum::body::Body::empty()))
+        }
+
+        #[doc(hidden)]
+        static __HAYAI_WS_ROUTE_ #fn_name: hayai::WsRouteInfo = hayai::WsRouteInfo {
+            path: #path,
+            axum_path: #path,
+            handler_name: #fn_name_str,
+            description: #description,
+            tags: &[],
+            register_fn: |app: hayai::axum::Router<hayai::AppState>| {
+                app.route(#path, hayai::axum::routing::get(#fn_name _ws_handler))
+            },
+        };
+        
+        hayai::inventory::submit! { &__HAYAI_WS_ROUTE_ #fn_name }
+    };
+
+    output.into()
 }
 
 #[proc_macro_attribute]

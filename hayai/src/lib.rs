@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 // Re-exports
-pub use hayai_macros::{get, post, put, delete, api_model};
+pub use hayai_macros::{get, post, put, delete, api_model, websocket};
 pub use serde;
 pub use serde_json;
 pub use schemars;
@@ -17,9 +17,109 @@ pub use inventory;
 pub use axum;
 pub use regex;
 
+/// Shared state passed to lifespan callbacks
+#[derive(Clone)]
+pub struct LifespanSharedState {
+    deps: std::sync::Arc<std::collections::HashMap<std::any::TypeId, std::sync::Arc<dyn std::any::Any + Send + Sync>>>,
+}
+
+impl LifespanSharedState {
+    pub fn new() -> Self {
+        Self { deps: std::sync::Arc::new(std::collections::HashMap::new()) }
+    }
+
+    pub fn get<T: 'static + Send + Sync>(&self) -> Option<std::sync::Arc<T>> {
+        self.deps
+            .get(&std::any::TypeId::of::<T>())
+            .and_then(|v| v.clone().downcast::<T>().ok())
+    }
+
+    pub(crate) fn from_deps(deps: std::collections::HashMap<std::any::TypeId, std::sync::Arc<dyn std::any::Any + Send + Sync>>) -> Self {
+        Self { deps: std::sync::Arc::new(deps) }
+    }
+}
+
+/// Type alias for lifespan callback functions
+pub type LifespanFn = std::pin::Pin<Box<dyn Fn(LifespanSharedState) -> LifespanFuture + Send + Sync>>;
+pub type LifespanFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// Lifespan configuration for startup/shutdown hooks
+#[derive(Clone)]
+pub struct Lifespan {
+    /// Called when the server starts, before accepting connections
+    pub on_startup: Option<LifespanFn>,
+    /// Called when the server shuts down, before stopping accepting connections
+    pub on_shutdown: Option<LifespanFn>,
+    /// Internal: dependencies for callbacks
+    pub(crate) deps: std::collections::HashMap<std::any::TypeId, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+impl Lifespan {
+    /// Create a new Lifespan configuration
+    pub fn new() -> Self {
+        Self {
+            on_startup: None,
+            on_shutdown: None,
+            deps: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Set the startup callback - receives shared state and runs before server starts
+    pub fn on_startup<F>(mut self, f: F) -> Self 
+    where
+        F: Fn(LifespanSharedState) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync + 'static,
+    {
+        self.on_startup = Some(Box::pin(f));
+        self
+    }
+
+    /// Set the shutdown callback - receives shared state and runs during graceful shutdown
+    pub fn on_shutdown<F>(mut self, f: F) -> Self 
+    where
+        F: Fn(LifespanSharedState) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync + 'static,
+    {
+        self.on_shutdown = Some(Box::pin(f));
+        self
+    }
+}
+
+impl Default for Lifespan {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Represents an uploaded file from a multipart form
+#[derive(Debug, Clone)]
+pub struct UploadFile {
+    /// The filename as provided by the client
+    pub filename: Option<String>,
+    /// The content type of the file
+    pub content_type: Option<String>,
+    /// The file content as bytes
+    pub content: Vec<u8>,
+}
+
+impl UploadFile {
+    /// Create a new UploadFile
+    pub fn new(filename: Option<String>, content_type: Option<String>, content: Vec<u8>) -> Self {
+        Self { filename, content_type, content }
+    }
+}
+
+/// Form data extractor for application/x-www-form-urlencoded
+pub struct Form<T>(pub T);
+
+impl<T> std::ops::Deref for Form<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
 pub mod prelude {
     pub use crate::{get, post, put, delete, api_model};
-    pub use crate::{HayaiApp, HayaiRouter, Dep, ApiError, Validate};
+    pub use crate::{HayaiApp, HayaiRouter, Dep, Form, UploadFile, ApiError, Validate};
     pub use crate::axum::extract::Query;
 }
 
@@ -548,6 +648,7 @@ impl HayaiApp {
                 map
             },
             security,
+            extensions: None,
         }
     }
 
