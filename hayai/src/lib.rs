@@ -18,7 +18,7 @@ pub use axum;
 pub use regex;
 
 /// Shared state passed to lifespan callbacks
-#[derive(Clone)]
+
 pub struct LifespanSharedState {
     deps: std::sync::Arc<std::collections::HashMap<std::any::TypeId, std::sync::Arc<dyn std::any::Any + Send + Sync>>>,
 }
@@ -43,8 +43,7 @@ impl LifespanSharedState {
 pub type LifespanFn = std::pin::Pin<Box<dyn Fn(LifespanSharedState) -> LifespanFuture + Send + Sync>>;
 pub type LifespanFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
-/// Lifespan configuration for startup/shutdown hooks
-#[derive(Clone)]
+
 pub struct Lifespan {
     /// Called when the server starts, before accepting connections
     pub on_startup: Option<LifespanFn>,
@@ -140,6 +139,7 @@ pub trait HasSchemaPatches {
 }
 
 /// Application state holding dependency injection container
+
 #[derive(Clone)]
 pub struct AppState {
     deps: Arc<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
