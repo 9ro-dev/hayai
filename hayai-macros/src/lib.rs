@@ -29,6 +29,7 @@ fn is_query_type(ty: &Type) -> bool {
     false
 }
 
+#[allow(dead_code)]
 fn is_upload_file_type(ty: &Type) -> bool {
     if let Type::Path(tp) = ty {
         if let Some(seg) = tp.path.segments.last() {
@@ -38,6 +39,7 @@ fn is_upload_file_type(ty: &Type) -> bool {
     false
 }
 
+#[allow(dead_code)]
 fn is_form_type(ty: &Type) -> bool {
     if let Type::Path(tp) = ty {
         if let Some(seg) = tp.path.segments.last() {
