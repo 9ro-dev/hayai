@@ -767,7 +767,23 @@ fn api_model_struct(input: ItemStruct) -> TokenStream {
                     CACHE.get_or_init(|| {
                         let base = hayai::schemars::schema_for!(#name);
                         let result = hayai::openapi::schema_from_schemars_full(#name_str, &base);
-                        result.nested
+                        let mut nested = result.nested;
+                        
+                        // Apply patches to nested schemas from their SchemaInfo
+                        let nested_names: Vec<String> = nested.keys().cloned().collect();
+                        for nested_name in nested_names {
+                            // Look up the SchemaInfo for this nested type
+                            let schemas: Vec<_> = hayai::inventory::iter::<hayai::SchemaInfo>().collect();
+                            if let Some(info) = schemas.iter().find(|s| s.name == nested_name) {
+                                // Get the schema with patches applied
+                                let patched_schema = (info.schema_fn)();
+                                // Replace the nested schema with the patched version
+                                if let Some(schema) = nested.get_mut(&nested_name) {
+                                    *schema = patched_schema;
+                                }
+                            }
+                        }
+                        nested
                     }).clone()
                 },
             }
