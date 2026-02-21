@@ -70,6 +70,23 @@ fn get_vec_inner_type_name(ty: &Type) -> Option<String> {
     None
 }
 
+/// Check if the type is Result<T, E> and return the inner Ok type
+fn get_result_inner_type(ty: &Type) -> Option<&Type> {
+    if let Type::Path(tp) = ty {
+        if let Some(seg) = tp.path.segments.last() {
+            if seg.ident == "Result" {
+                return extract_inner_type(seg);
+            }
+        }
+    }
+    None
+}
+
+/// Check if the type is Result<T, E>
+fn is_result_type(ty: &Type) -> bool {
+    get_result_inner_type(ty).is_some()
+}
+
 fn is_primitive_type(ty: &Type) -> bool {
     let name = get_type_name(ty);
     matches!(name.as_str(), "i8"|"i16"|"i32"|"i64"|"i128"|"u8"|"u16"|"u32"|"u64"|"u128"|"f32"|"f64"|"String"|"bool")
@@ -91,7 +108,78 @@ fn extract_doc_comment(attrs: &[syn::Attribute]) -> String {
 }
 
 fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> TokenStream {
-    let path = parse_macro_input!(attr as LitStr).value();
+    // Parse: either just a string path, or (path = "/path", validate_response = true)
+    let validate_response: bool;
+    let path_str: String;
+    
+    // Convert to string for simple parsing
+    let attr_str = attr.to_string();
+    
+    // Check if validate_response = true is present
+    let validate_response_default = attr_str.contains("validate_response") && 
+        (attr_str.contains("= true") || attr_str.contains("=true"));
+    
+    // Try parsing as simple string first
+    if let Ok(lit) = syn::parse::<LitStr>(attr.clone()) {
+        path_str = lit.value();
+        validate_response = false;
+    } else if attr_str.contains("path = ") || attr_str.contains("path=") {
+        // Parse format: (path = "/users", validate_response = true)
+        // Extract path value after "path = " or "path="
+        let mut found_path = None;
+        
+        // Simple string search
+        if let Some(pos) = attr_str.find("path = ") {
+            let rest = &attr_str[pos + 7..];
+            if let Some(end) = rest.find(',') {
+                let path_val = rest[..end].trim().trim_matches('"');
+                found_path = Some(path_val.to_string());
+            } else {
+                let path_val = rest.trim().trim_matches('"');
+                found_path = Some(path_val.to_string());
+            }
+        } else if let Some(pos) = attr_str.find("path=") {
+            let rest = &attr_str[pos + 5..];
+            if let Some(end) = rest.find(',') {
+                let path_val = rest[..end].trim().trim_matches('"');
+                found_path = Some(path_val.to_string());
+            } else {
+                let path_val = rest.trim().trim_matches('"');
+                found_path = Some(path_val.to_string());
+            }
+        }
+        
+        path_str = found_path.unwrap_or_else(|| "/".to_string());
+        validate_response = validate_response_default;
+    } else if attr_str.contains('"') {
+        // Try to extract any quoted string as the path
+        let start = attr_str.find('"');
+        if let Some(s) = start {
+            let rest = &attr_str[s + 1..];
+            if let Some(e) = rest.find('"') {
+                let potential_path = &rest[..e];
+                if !potential_path.contains("validate_response") {
+                    path_str = potential_path.to_string();
+                    validate_response = validate_response_default;
+                } else {
+                    path_str = "/".to_string();
+                    validate_response = validate_response_default;
+                }
+            } else {
+                path_str = "/".to_string();
+                validate_response = validate_response_default;
+            }
+        } else {
+            path_str = "/".to_string();
+            validate_response = validate_response_default;
+        }
+    } else {
+        // Fallback
+        path_str = "/".to_string();
+        validate_response = validate_response_default;
+    }
+    
+    let path = path_str;
     let input_fn = parse_macro_input!(item as ItemFn);
     let fn_name = &input_fn.sig.ident;
     let fn_vis = &input_fn.vis;
@@ -259,20 +347,181 @@ fn route_macro_impl(method: &str, attr: TokenStream, item: TokenStream) -> Token
 
     // Generate response based on status code
     let status_lit = proc_macro2::Literal::u16_unsuffixed(success_status);
+    
+    // Build validation code based on return type and validate_response flag
+    // Note: For Result types, validation happens in the match arm where the variable is called `value`
+    // For direct types, the variable is called `result`
+    let validation_expr: proc_macro2::TokenStream = if validate_response {
+        if let Some(ret_ty) = return_type {
+            let is_result = is_result_type(ret_ty);
+            let is_vec = get_vec_inner_type_name(ret_ty).is_some();
+            
+            if is_result {
+                // Result<T, ApiError> - validate T (variable is `value` in the match arm)
+                if is_vec {
+                    // Result<Vec<T>, ApiError> - validate each item
+                    quote! {
+                        for (i, item) in value.iter().enumerate() {
+                            if let Err(errors) = item.validate() {
+                                return Err(hayai::ApiError::internal(
+                                    format!("Response validation failed at index {}: {}", i, errors.join(", "))
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    // Result<T, ApiError> - validate Ok variant (variable is `value`)
+                    quote! {
+                        if let Err(errors) = value.validate() {
+                            return Err(hayai::ApiError::internal(
+                                format!("Response validation failed: {}", errors.join(", "))
+                            ));
+                        }
+                    }
+                }
+            } else if is_vec {
+                // Vec<T> - validate each item (variable is `result`)
+                quote! {
+                    for (i, item) in result.iter().enumerate() {
+                        if let Err(errors) = item.validate() {
+                            return Err(hayai::ApiError::internal(
+                                format!("Response validation failed at index {}: {}", i, errors.join(", "))
+                            ));
+                        }
+                    }
+                }
+            } else {
+                // Direct type T - validate
+                quote! {
+                    if let Err(errors) = result.validate() {
+                        return Err(hayai::ApiError::internal(
+                            format!("Response validation failed: {}", errors.join(", "))
+                        ));
+                    }
+                }
+            }
+        } else {
+            quote! {} // No return type, no validation
+        }
+    } else {
+        quote! {} // validate_response = false
+    };
+    
     let response_expr = if success_status == 204 {
         quote! {
             let _ = #fn_name(#(#call_args),*).await;
             Ok((hayai::axum::http::StatusCode::from_u16(#status_lit).unwrap(),).into_response())
         }
+    } else if validate_response {
+        // Generate response with validation
+        if let Some(ret_ty) = return_type {
+            let is_result = is_result_type(ret_ty);
+            
+            if is_result {
+                // Result<T, E> - handle both Ok and Err cases properly
+                if validate_response {
+                    // With validation: validate Ok variant, pass through Err
+                    quote! {
+                        match #fn_name(#(#call_args),*).await {
+                            Ok(value) => {
+                                // Validate the Ok value
+                                #validation_expr
+                                // Serialize and return
+                                let json_value = hayai::serde_json::to_value(&value)
+                                    .map_err(|e| hayai::ApiError::internal(format!("Response serialization failed: {}", e)))?;
+                                Ok((
+                                    hayai::axum::http::StatusCode::from_u16(#status_lit).unwrap(),
+                                    hayai::axum::Json(json_value),
+                                ).into_response())
+                            }
+                            Err(e) => {
+                                // Error case - convert to response
+                                Ok(e.into_response())
+                            }
+                        }
+                    }
+                } else {
+                    // No validation: just pass through
+                    quote! {
+                        match #fn_name(#(#call_args),*).await {
+                            Ok(value) => {
+                                let json_value = hayai::serde_json::to_value(&value)
+                                    .map_err(|e| hayai::ApiError::internal(format!("Response serialization failed: {}", e)))?;
+                                Ok((
+                                    hayai::axum::http::StatusCode::from_u16(#status_lit).unwrap(),
+                                    hayai::axum::Json(json_value),
+                                ).into_response())
+                            }
+                            Err(e) => Ok(e.into_response()),
+                        }
+                    }
+                }
+            } else {
+                // Direct type - validate before serializing
+                quote! {
+                    let result = #fn_name(#(#call_args),*).await;
+                    #validation_expr
+                    let value = hayai::serde_json::to_value(&result)
+                        .map_err(|e| hayai::ApiError::internal(format!("Response serialization failed: {}", e)))?;
+                    Ok((
+                        hayai::axum::http::StatusCode::from_u16(#status_lit).unwrap(),
+                        hayai::axum::Json(value),
+                    ).into_response())
+                }
+            }
+        } else {
+            quote! {
+                let result = #fn_name(#(#call_args),*).await;
+                let value = hayai::serde_json::to_value(&result)
+                    .map_err(|e| hayai::ApiError::internal(format!("Response serialization failed: {}", e)))?;
+                Ok((
+                    hayai::axum::http::StatusCode::from_u16(#status_lit).unwrap(),
+                    hayai::axum::Json(value),
+                ).into_response())
+            }
+        }
     } else {
-        quote! {
-            let result = #fn_name(#(#call_args),*).await;
-            let value = hayai::serde_json::to_value(&result)
-                .map_err(|e| hayai::ApiError::internal(format!("Response serialization failed: {}", e)))?;
-            Ok((
-                hayai::axum::http::StatusCode::from_u16(#status_lit).unwrap(),
-                hayai::axum::Json(value),
-            ).into_response())
+        // No validation - check if Result type
+        if let Some(ret_ty) = return_type {
+            let is_result = is_result_type(ret_ty);
+            
+            if is_result {
+                // Result<T, E> - handle both Ok and Err cases properly (without validation)
+                quote! {
+                    match #fn_name(#(#call_args),*).await {
+                        Ok(value) => {
+                            let json_value = hayai::serde_json::to_value(&value)
+                                .map_err(|e| hayai::ApiError::internal(format!("Response serialization failed: {}", e)))?;
+                            Ok((
+                                hayai::axum::http::StatusCode::from_u16(#status_lit).unwrap(),
+                                hayai::axum::Json(json_value),
+                            ).into_response())
+                        }
+                        Err(e) => Ok(e.into_response()),
+                    }
+                }
+            } else {
+                // Direct type - just serialize
+                quote! {
+                    let result = #fn_name(#(#call_args),*).await;
+                    let value = hayai::serde_json::to_value(&result)
+                        .map_err(|e| hayai::ApiError::internal(format!("Response serialization failed: {}", e)))?;
+                    Ok((
+                        hayai::axum::http::StatusCode::from_u16(#status_lit).unwrap(),
+                        hayai::axum::Json(value),
+                    ).into_response())
+                }
+            }
+        } else {
+            quote! {
+                let result = #fn_name(#(#call_args),*).await;
+                let value = hayai::serde_json::to_value(&result)
+                    .map_err(|e| hayai::ApiError::internal(format!("Response serialization failed: {}", e)))?;
+                Ok((
+                    hayai::axum::http::StatusCode::from_u16(#status_lit).unwrap(),
+                    hayai::axum::Json(value),
+                ).into_response())
+            }
         }
     };
 

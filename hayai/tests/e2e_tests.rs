@@ -486,3 +486,182 @@ async fn test_router_e2e_nested_routers() {
 }
 
 // ---- Multipart File Upload E2E ----
+
+// ---- Response Validation E2E Tests ----
+
+#[api_model]
+#[derive(Debug, Clone)]
+struct ValidatedUser {
+    id: i64,
+    #[validate(min_length = 1, max_length = 100)]
+    name: String,
+    #[validate(email)]
+    email: String,
+}
+
+// Handler that returns a valid model - should succeed with validate_response = true
+#[get("/validated-user/{id}", validate_response = true)]
+async fn get_validated_user(id: i64) -> ValidatedUser {
+    ValidatedUser {
+        id,
+        name: "Alice".into(),
+        email: "alice@example.com".into(),
+    }
+}
+
+// Handler that returns an INVALID model (name too short) with validate_response = true
+// Should return 500
+#[get("/validated-user-invalid/{id}", validate_response = true)]
+async fn get_validated_user_invalid(id: i64) -> ValidatedUser {
+    ValidatedUser {
+        id,
+        name: "".into(), // Invalid: min_length = 1
+        email: "alice@example.com".into(),
+    }
+}
+
+// Handler that returns a model WITHOUT validate_response (default)
+// Should succeed even with invalid data
+#[get("/validated-user-no-validation/{id}")]
+async fn get_validated_user_no_validation(id: i64) -> ValidatedUser {
+    ValidatedUser {
+        id,
+        name: "".into(), // Invalid but no validation
+        email: "alice@example.com".into(),
+    }
+}
+
+// Handler that returns Result<ValidatedUser, ApiError> with validate_response = true
+// Success case - should work
+#[get("/validated-user-result/{id}", validate_response = true)]
+async fn get_validated_user_result(id: i64) -> Result<ValidatedUser, ApiError> {
+    Ok(ValidatedUser {
+        id,
+        name: "Bob".into(),
+        email: "bob@example.com".into(),
+    })
+}
+
+// Handler that returns Result<ValidatedUser, ApiError> with validate_response = true
+// Error case - should propagate the error, not validate
+#[get("/validated-user-result-error/{id}", validate_response = true)]
+async fn get_validated_user_result_error(id: i64) -> Result<ValidatedUser, ApiError> {
+    Err(ApiError::not_found(format!("User {} not found", id)))
+}
+
+// Handler that returns Vec<ValidatedUser> with validate_response = true
+// Valid items - should succeed
+#[get("/validated-users", validate_response = true)]
+async fn get_validated_users() -> Vec<ValidatedUser> {
+    vec![
+        ValidatedUser { id: 1, name: "Alice".into(), email: "alice@example.com".into() },
+        ValidatedUser { id: 2, name: "Bob".into(), email: "bob@example.com".into() },
+    ]
+}
+
+// Handler that returns Vec<ValidatedUser> with validate_response = true
+// Invalid item in collection - should return 500
+#[get("/validated-users-invalid", validate_response = true)]
+async fn get_validated_users_invalid() -> Vec<ValidatedUser> {
+    vec![
+        ValidatedUser { id: 1, name: "Alice".into(), email: "alice@example.com".into() },
+        ValidatedUser { id: 2, name: "".into(), email: "bob@example.com".into() }, // Invalid: empty name
+    ]
+}
+
+// Handler that returns Vec<ValidatedUser> WITHOUT validate_response
+// Invalid item in collection - should succeed
+#[get("/validated-users-no-validation")]
+async fn get_validated_users_no_validation() -> Vec<ValidatedUser> {
+    vec![
+        ValidatedUser { id: 1, name: "".into(), email: "alice@example.com".into() }, // Invalid but no validation
+    ]
+}
+
+async fn spawn_validation_app() -> String {
+    let app = HayaiApp::new()
+        .title("Validation Test API")
+        .version("0.1.0")
+        .into_router();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+#[tokio::test]
+async fn test_response_validation_valid_model_returns_200() {
+    let base = spawn_validation_app().await;
+    let resp = reqwest::get(format!("{base}/validated-user/42")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], 42);
+    assert_eq!(body["name"], "Alice");
+}
+
+#[tokio::test]
+async fn test_response_validation_invalid_model_returns_500() {
+    let base = spawn_validation_app().await;
+    let resp = reqwest::get(format!("{base}/validated-user-invalid/42")).await.unwrap();
+    assert_eq!(resp.status(), 500); // Response validation failed
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("Response validation failed"));
+}
+
+#[tokio::test]
+async fn test_response_validation_disabled_invalid_model_returns_200() {
+    let base = spawn_validation_app().await;
+    let resp = reqwest::get(format!("{base}/validated-user-no-validation/42")).await.unwrap();
+    assert_eq!(resp.status(), 200); // No validation, succeeds even with invalid data
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], 42);
+    assert_eq!(body["name"], ""); // Invalid but allowed
+}
+
+#[tokio::test]
+async fn test_response_validation_result_ok_returns_200() {
+    let base = spawn_validation_app().await;
+    let resp = reqwest::get(format!("{base}/validated-user-result/42")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["name"], "Bob");
+}
+
+#[tokio::test]
+async fn test_response_validation_result_err_propagates() {
+    let base = spawn_validation_app().await;
+    let resp = reqwest::get(format!("{base}/validated-user-result-error/42")).await.unwrap();
+    assert_eq!(resp.status(), 404); // Error is propagated, not validated
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("not found"));
+}
+
+#[tokio::test]
+async fn test_response_validation_vec_valid_returns_200() {
+    let base = spawn_validation_app().await;
+    let resp = reqwest::get(format!("{base}/validated-users")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_response_validation_vec_invalid_returns_500() {
+    let base = spawn_validation_app().await;
+    let resp = reqwest::get(format!("{base}/validated-users-invalid")).await.unwrap();
+    assert_eq!(resp.status(), 500);
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("Response validation failed"));
+}
+
+#[tokio::test]
+async fn test_response_validation_vec_disabled_returns_200() {
+    let base = spawn_validation_app().await;
+    let resp = reqwest::get(format!("{base}/validated-users-no-validation")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body.as_array().unwrap().len(), 1);
+}
